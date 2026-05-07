@@ -236,6 +236,28 @@ app.delete('/calendar/events/:eventId', async (req, res) => {
   }
 });
 
+app.patch('/calendar/events/:eventId', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const calendar = google.calendar({ version: 'v3', auth });
+    
+    const event = await calendar.events.patch({
+      calendarId: 'primary',
+      eventId: req.params.eventId,
+      resource: req.body
+    });
+    
+    res.json({ 
+      event: event.data,
+      tokens: auth.credentials
+    });
+  } catch (error) {
+    console.error('Calendar update error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // =================
 // DRIVE
 // =================
@@ -306,6 +328,51 @@ app.post('/drive/upload', async (req, res) => {
     });
   } catch (error) {
     console.error('Drive upload error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/drive/download/:fileId', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    
+    const response = await drive.files.get({
+      fileId: req.params.fileId,
+      alt: 'media'
+    }, { responseType: 'arraybuffer' });
+    
+    res.json({
+      content: Buffer.from(response.data).toString('base64'),
+      tokens: auth.credentials
+    });
+  } catch (error) {
+    console.error('Drive download error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/drive/create-folder', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    
+    const folder = await drive.files.create({
+      resource: {
+        name: req.body.folderName,
+        mimeType: 'application/vnd.google-apps.folder'
+      },
+      fields: 'id, name, webViewLink'
+    });
+    
+    res.json({
+      folder: folder.data,
+      tokens: auth.credentials
+    });
+  } catch (error) {
+    console.error('Drive create folder error:', error);
     res.status(500).json({ error: error.message });
   }
 });
