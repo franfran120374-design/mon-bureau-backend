@@ -12,6 +12,173 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY
 });
 dotenv.config();
+// ========== ROUTES API CLAUDE - Couche 4 ==========
+
+app.post('/claude/summarize', async (req, res) => {
+  try {
+    const { text, type } = req.body;
+    
+    let prompt = '';
+    if (type === 'article') {
+      prompt = `Résume cet article en 3 points clés (max 50 mots par point). Sois concis et factuel.\n\nArticle:\n${text}`;
+    } else if (type === 'note') {
+      prompt = `Résume cette note en gardant les informations essentielles.\n\nNote:\n${text}`;
+    } else if (type === 'meeting') {
+      prompt = `Résume cet événement/réunion : quoi, quand, avec qui, objectifs.\n\nÉvénement:\n${text}`;
+    }
+    
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    
+    res.json({ 
+      success: true, 
+      summary: message.content[0].text,
+      usage: message.usage
+    });
+  } catch (error) {
+    console.error('Summarize error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/claude/factcheck', async (req, res) => {
+  try {
+    const { title, content, url } = req.body;
+    
+    const prompt = `Tu es un fact-checker expert. Analyse cet article et évalue sa crédibilité.
+
+Article:
+Titre: ${title}
+URL: ${url}
+Contenu: ${content}
+
+Fournis une analyse structurée en JSON avec:
+{
+  "score": 0-100 (score de confiance),
+  "verdict": "Fiable" | "Douteux" | "Faux" | "Non vérifiable",
+  "points_positifs": ["point1", "point2"],
+  "points_negatifs": ["point1", "point2"],
+  "recommandation": "courte phrase"
+}
+
+Réponds UNIQUEMENT avec le JSON, sans texte avant ou après.`;
+    
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 800,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    
+    const responseText = message.content[0].text;
+    
+    let analysis;
+    try {
+      const cleanText = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      analysis = JSON.parse(cleanText);
+    } catch (parseError) {
+      analysis = {
+        score: 50,
+        verdict: "Non vérifiable",
+        points_positifs: ["Analyse en cours"],
+        points_negatifs: ["Format de réponse inattendu"],
+        recommandation: "Vérifier manuellement les sources"
+      };
+    }
+    
+    res.json({ success: true, analysis, usage: message.usage });
+  } catch (error) {
+    console.error('Fact-check error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/claude/chat', async (req, res) => {
+  try {
+    const { message: userMessage, context } = req.body;
+    
+    let systemPrompt = `Tu es l'assistant personnel de l'utilisateur. Tu as accès à ses données :`;
+    
+    if (context?.tasks) {
+      systemPrompt += `\n\nTÂCHES EN COURS:\n${JSON.stringify(context.tasks, null, 2)}`;
+    }
+    if (context?.events) {
+      systemPrompt += `\n\nÉVÉNEMENTS À VENIR:\n${JSON.stringify(context.events, null, 2)}`;
+    }
+    if (context?.notes) {
+      systemPrompt += `\n\nNOTES RÉCENTES:\n${JSON.stringify(context.notes, null, 2)}`;
+    }
+    
+    systemPrompt += `\n\nRéponds de façon concise et actionnable.`;
+    
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMessage }]
+    });
+    
+    res.json({ 
+      success: true, 
+      reply: message.content[0].text,
+      usage: message.usage
+    });
+  } catch (error) {
+    console.error('Chat error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/claude/analyze', async (req, res) => {
+  try {
+    const { type, data } = req.body;
+    
+    let prompt = '';
+    if (type === 'tasks') {
+      prompt = `Analyse ces tâches et fournis des insights en JSON:
+${JSON.stringify(data, null, 2)}
+
+Format:
+{
+  "total": nombre,
+  "completed_rate": pourcentage,
+  "patterns": ["pattern1", "pattern2"],
+  "suggestions": ["suggestion1", "suggestion2"]
+}`;
+    } else if (type === 'notes') {
+      prompt = `Analyse ces notes et extrais les thèmes en JSON:
+${JSON.stringify(data, null, 2)}
+
+Format:
+{
+  "themes": ["thème1", "thème2"],
+  "mood_trend": "positif|neutre|négatif",
+  "key_topics": ["sujet1"]
+}`;
+    }
+    
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 800,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    
+    let insights;
+    try {
+      const cleanText = message.content[0].text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      insights = JSON.parse(cleanText);
+    } catch (e) {
+      insights = { error: "Format inattendu" };
+    }
+    
+    res.json({ success: true, insights, usage: message.usage });
+  } catch (error) {
+    console.error('Analyze error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
