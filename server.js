@@ -6,7 +6,11 @@ import cors from 'cors';
 import { google } from 'googleapis';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
-
+import Anthropic from '@anthropic-ai/sdk';
+ 
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
+});
 dotenv.config();
 
 const app = express();
