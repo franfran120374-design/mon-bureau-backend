@@ -569,6 +569,203 @@ app.get('/health', (req, res) => {
 });
 
 // =================
+// SPOTIFY AUTH
+// =================
+
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || '8611685c700247fe8342ff3e255578de';
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '381515c912c3439cb87beb47f4936a4d';
+const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || 'https://mon-bureau-backend.onrender.com/auth/spotify/callback';
+
+// Génère l'URL de connexion Spotify
+app.get('/auth/spotify/url', (req, res) => {
+  const scopes = [
+    'user-read-private',
+    'user-read-email',
+    'user-top-read',
+    'user-read-currently-playing',
+    'user-read-recently-played'
+  ];
+  
+  const authUrl = 'https://accounts.spotify.com/authorize?' + new URLSearchParams({
+    response_type: 'code',
+    client_id: SPOTIFY_CLIENT_ID,
+    scope: scopes.join(' '),
+    redirect_uri: SPOTIFY_REDIRECT_URI,
+    state: req.query.frontend || ''
+  });
+  
+  res.json({ url: authUrl });
+});
+
+// Callback Spotify OAuth
+app.get('/auth/spotify/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code) return res.send('<h1>Erreur: code manquant</h1>');
+  
+  try {
+    // Échanger le code contre des tokens
+    const tokenResponse = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': 'Basic ' + Buffer.from(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET).toString('base64')
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: SPOTIFY_REDIRECT_URI
+      })
+    });
+    
+    const tokens = await tokenResponse.json();
+    
+    if (tokens.error) {
+      throw new Error(tokens.error_description || tokens.error);
+    }
+    
+    // Récupérer infos utilisateur
+    const userResponse = await fetch('https://api.spotify.com/v1/me', {
+      headers: {
+        'Authorization': `Bearer ${tokens.access_token}`
+      }
+    });
+    
+    const userData = await userResponse.json();
+    
+    const spotifyData = {
+      id: userData.id,
+      email: userData.email,
+      name: userData.display_name || userData.email,
+      picture: userData.images?.[0]?.url,
+      tokens: tokens,
+      addedAt: Date.now()
+    };
+    
+    // Page de confirmation
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Spotify connecté</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 40px; text-align: center; background: #1DB954; color: white; }
+    .card { background: rgba(0,0,0,0.3); padding: 30px; border-radius: 12px; max-width: 400px; margin: 0 auto; }
+    h1 { margin: 0 0 10px; }
+    img { width: 80px; height: 80px; border-radius: 50%; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎵 Spotify connecté</h1>
+    ${userData.images?.[0]?.url ? `<img src="${userData.images[0].url}" alt="">` : ''}
+    <h2>${userData.display_name || userData.email}</h2>
+    <p style="margin-top:20px; font-size:14px">Cette fenêtre va se fermer...</p>
+  </div>
+  <script>
+    const spotifyData = ${JSON.stringify(spotifyData)};
+    
+    if (window.opener) {
+      try {
+        window.opener.postMessage({ 
+          type: 'SPOTIFY_AUTH_SUCCESS', 
+          account: spotifyData 
+        }, '*');
+      } catch(e) {
+        console.error('postMessage failed:', e);
+      }
+    }
+    
+    try {
+      localStorage.setItem('pendingSpotifyAuth', JSON.stringify(spotifyData));
+    } catch(e) {
+      console.error('localStorage failed:', e);
+    }
+    
+    setTimeout(() => {
+      window.close();
+      if (!window.closed) {
+        document.body.innerHTML = '<div class="card"><h1>✓ Connexion OK</h1><p>Tu peux fermer cette fenêtre.</p></div>';
+      }
+    }, 1500);
+  </script>
+</body>
+</html>`);
+  } catch (error) {
+    console.error('Spotify auth error:', error);
+    res.send(`<h1>Erreur Spotify</h1><pre>${error.message}</pre>`);
+  }
+});
+
+// Refresh token Spotify
+app.post('/spotify/refresh', async (req, res) => {
+  try {
+    const { refresh_token } = req.body;
+    
+    const response = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': 'Basic ' + Buffer.from(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET).toString('base64')
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refresh_token
+      })
+    });
+    
+    const tokens = await response.json();
+    res.json(tokens);
+  } catch (error) {
+    console.error('Spotify refresh error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Top tracks
+app.get('/spotify/top-tracks', async (req, res) => {
+  try {
+    const auth = req.headers.authorization;
+    if (!auth) throw new Error('Authorization header missing');
+    
+    const response = await fetch('https://api.spotify.com/v1/me/top/tracks?limit=20&time_range=medium_term', {
+      headers: {
+        'Authorization': auth
+      }
+    });
+    
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('Spotify top tracks error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Currently playing
+app.get('/spotify/currently-playing', async (req, res) => {
+  try {
+    const auth = req.headers.authorization;
+    if (!auth) throw new Error('Authorization header missing');
+    
+    const response = await fetch('https://api.spotify.com/v1/me/player/currently-playing', {
+      headers: {
+        'Authorization': auth
+      }
+    });
+    
+    if (response.status === 204) {
+      return res.json({ is_playing: false });
+    }
+    
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('Spotify currently playing error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================
 // START
 // =================
 
