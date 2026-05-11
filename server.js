@@ -766,6 +766,57 @@ app.get('/spotify/currently-playing', async (req, res) => {
 });
 
 // =================
+// GMAIL
+// =================
+
+app.get('/gmail/unread', async (req, res) => {
+  try {
+    const auth = req.headers.authorization;
+    if (!auth) throw new Error('Authorization header missing');
+    
+    const token = auth.split(' ')[1];
+    oauth2Client.setCredentials({ access_token: token });
+    
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    
+    const response = await gmail.users.messages.list({
+      userId: 'me',
+      q: 'is:unread',
+      maxResults: 5
+    });
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('Gmail unread error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/gmail/message/:id', async (req, res) => {
+  try {
+    const auth = req.headers.authorization;
+    if (!auth) throw new Error('Authorization header missing');
+    
+    const token = auth.split(' ')[1];
+    oauth2Client.setCredentials({ access_token: token });
+    
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    
+    const response = await gmail.users.messages.get({
+      userId: 'me',
+      id: req.params.id,
+      format: 'metadata',
+      metadataHeaders: ['From', 'Subject', 'Date']
+    });
+    
+    res.json(response.data);
+  } catch (error) {
+    console.error('Gmail message error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================
 // START
 // =================
 
