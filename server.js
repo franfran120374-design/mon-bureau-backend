@@ -525,10 +525,8 @@ app.post('/proxy/rss', async (req, res) => {
         const heure = heureMatch ? `${heureMatch[1].padStart(2,'0')}:${heureMatch[2]}` : '';
 
         // Extraire lieu et tarif du contenu
-        const lieuMatch = description.match(/(?:lieu|salle)[^:]{0,5}:?\s*([^<,\n]{3,40})/i);
-,]{3,40})/i);
-        const tarifMatch = description.match(/(?:tarif|prix|billet)[^:]{0,5}:?\s*([^<\n]{3,30})/i);
-]{3,30})/i);
+        const lieuMatch = description.match(/lieu[^:]{0,5}:([^<,]{3,40})/i);
+        const tarifMatch = description.match(/tarif[^:]{0,5}:([^<]{3,30})/i);
 
         events.push({
           id: link || Math.random().toString(36).substr(2,9),
