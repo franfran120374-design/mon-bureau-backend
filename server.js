@@ -568,6 +568,143 @@ app.post('/proxy/rss', async (req, res) => {
 });
 
 // =================
+// PROXY OPENAGENDA
+// =================
+
+const OA_KEY = '0895eaaa77584278ad341e9def08de13';
+
+// Chercher les agendas Toulouse
+app.get('/openagenda/agendas', async (req, res) => {
+  try {
+    const search = req.query.search || 'toulouse';
+    const resp = await fetch(`https://api.openagenda.com/v2/agendas?search=${encodeURIComponent(search)}&size=20`, {
+      headers: { 'key': OA_KEY, 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Récupérer les événements d'un ou plusieurs agendas
+app.get('/openagenda/events', async (req, res) => {
+  try {
+    const { agendaUid, dateFrom, dateTo, size = 100, keyword } = req.query;
+    if (!agendaUid) return res.status(400).json({ error: 'agendaUid requis' });
+
+    const params = new URLSearchParams();
+    params.set('size', size);
+    params.set('sort', 'timings.start');
+    if (dateFrom) params.set('timings[gte]', dateFrom + 'T00:00:00');
+    if (dateTo) params.set('timings[lte]', dateTo + 'T23:59:59');
+    if (keyword) params.set('search', keyword);
+
+    const url = `https://api.openagenda.com/v2/agendas/${agendaUid}/events?${params}`;
+    console.log('[OA] Fetch:', url);
+
+    const resp = await fetch(url, {
+      headers: { 'key': OA_KEY, 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${txt.substring(0,100)}`);
+    }
+    const data = await resp.json();
+    console.log(`[OA] ${data.events?.length || 0} events pour agenda ${agendaUid}`);
+    res.json(data);
+  } catch(e) {
+    console.error('[OA] Erreur:', e.message);
+    res.status(500).json({ error: e.message, events: [] });
+  }
+});
+
+// Route combinée : tous les agendas Toulouse en une fois
+app.get('/openagenda/toulouse', async (req, res) => {
+  try {
+    const { dateFrom, dateTo, size = 200 } = req.query;
+
+    // IDs des principaux agendas Toulouse sur OpenAgenda
+    // On les récupère dynamiquement si pas connus
+    const TOULOUSE_AGENDAS = [
+      { uid: 21670068, name: 'Toulouse Métropole' },
+      { uid: 49557303, name: 'Ville de Toulouse' },
+      { uid: 69703878, name: 'Toulouse Tourisme' },
+      { uid: 93814921, name: 'OpenAgenda Toulouse' },
+    ];
+
+    const params = new URLSearchParams();
+    params.set('size', size);
+    params.set('sort', 'timings.start');
+    if (dateFrom) params.set('timings[gte]', dateFrom + 'T00:00:00');
+    if (dateTo) params.set('timings[lte]', dateTo + 'T23:59:59');
+
+    // Chercher dans plusieurs agendas en parallèle
+    const results = await Promise.allSettled(
+      TOULOUSE_AGENDAS.map(agenda =>
+        fetch(`https://api.openagenda.com/v2/agendas/${agenda.uid}/events?${params}`, {
+          headers: { 'key': OA_KEY },
+          signal: AbortSignal.timeout(8000)
+        }).then(r => r.ok ? r.json() : null).catch(() => null)
+      )
+    );
+
+    let allEvents = [];
+    results.forEach((result, i) => {
+      if (result.status === 'fulfilled' && result.value?.events?.length) {
+        const agenda = TOULOUSE_AGENDAS[i];
+        console.log(`[OA] ${agenda.name}: ${result.value.events.length} events`);
+        result.value.events.forEach(e => {
+          const timing = e.timings?.[0] || {};
+          const dateStr = (timing.begin || '').split('T')[0];
+          const heure = (timing.begin || '').split('T')[1]?.substring(0,5) || '';
+          const title = e.title?.fr || e.title?.en || Object.values(e.title||{})[0] || '';
+          const desc = e.description?.fr || Object.values(e.description||{})[0] || '';
+          const loc = e.location || {};
+          const kw = (e.keywords?.fr || []).concat(e.keywords?.en || []).join(' ');
+          allEvents.push({
+            id: String(e.uid),
+            title,
+            description: (desc||'').substring(0, 300),
+            date: dateStr,
+            heure,
+            horaires: heure ? `${dateStr} à ${heure}` : dateStr,
+            lieu: loc.name || '',
+            adresse: [loc.address, loc.postalCode, loc.city].filter(Boolean).join(', '),
+            commune: loc.city || 'Toulouse',
+            tarif: e.conditions?.fr || '',
+            isGratuit: (e.conditions?.fr || '').toLowerCase().includes('gratuit') || !(e.conditions?.fr||'').trim(),
+            url: e.canonicalUrl || `https://openagenda.com/fr/${e.slug}`,
+            keywords: kw,
+            image: e.image?.base || '',
+            source: agenda.name,
+          });
+        });
+      }
+    });
+
+    // Dédupliquer par uid
+    const seen = new Set();
+    allEvents = allEvents.filter(e => {
+      if (seen.has(e.id)) return false;
+      seen.add(e.id); return true;
+    });
+
+    // Trier par date
+    allEvents.sort((a, b) => (a.date||'').localeCompare(b.date||'') || (a.heure||'').localeCompare(b.heure||''));
+
+    console.log(`[OA] Total Toulouse: ${allEvents.length} events`);
+    res.json({ events: allEvents, total: allEvents.length });
+  } catch(e) {
+    console.error('[OA] Erreur toulouse:', e.message);
+    res.status(500).json({ error: e.message, events: [] });
+  }
+});
+
+// =================
 // HEALTH
 // =================
 
