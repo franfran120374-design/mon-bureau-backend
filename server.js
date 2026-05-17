@@ -643,19 +643,24 @@ app.get('/openagenda/toulouse', async (req, res) => {
       { uid: 50781256,  name: 'Launaguet' },
     ];
 
-    const params = new URLSearchParams();
-    params.set('size', size);
-    params.set('sort', 'timings.start');
-    if (dateFrom) params.set('timings[gte]', dateFrom + 'T00:00:00');
-    if (dateTo) params.set('timings[lte]', dateTo + 'T23:59:59');
+    // Construire l'URL manuellement pour les paramètres avec crochets
+    const buildUrl = (uid) => {
+      let url = `https://api.openagenda.com/v2/agendas/${uid}/events?size=${size}&sort=timings.start`;
+      if (dateFrom) url += `&timings[gte]=${encodeURIComponent(dateFrom + 'T00:00:00')}`;
+      if (dateTo) url += `&timings[lte]=${encodeURIComponent(dateTo + 'T23:59:59')}`;
+      return url;
+    };
 
     // Chercher dans plusieurs agendas en parallèle
     const results = await Promise.allSettled(
       TOULOUSE_AGENDAS.map(agenda =>
-        fetch(`https://api.openagenda.com/v2/agendas/${agenda.uid}/events?${params}`, {
+        fetch(buildUrl(agenda.uid), {
           headers: { 'key': OA_KEY },
           signal: AbortSignal.timeout(8000)
-        }).then(r => r.ok ? r.json() : null).catch(() => null)
+        }).then(r => {
+          if (!r.ok) { console.warn(`[OA] ${agenda.name} HTTP ${r.status}`); return null; }
+          return r.json();
+        }).catch(e => { console.warn(`[OA] ${agenda.name} erreur:`, e.message); return null; })
       )
     );
 
