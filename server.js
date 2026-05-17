@@ -683,11 +683,16 @@ app.get('/openagenda/toulouse', async (req, res) => {
             adresse: [loc.address, loc.postalCode, loc.city].filter(Boolean).join(', '),
             commune: loc.city || 'Toulouse',
             tarif: e.conditions?.fr || '',
-            isGratuit: (e.conditions?.fr || '').toLowerCase().includes('gratuit') || !(e.conditions?.fr||'').trim(),
+            isGratuit: (e.conditions?.fr || '').toLowerCase().includes('gratuit') ||
+                       (e.conditions?.fr || '').toLowerCase().includes('libre') ||
+                       (e.conditions?.fr || '').toLowerCase().includes('entrée libre') ||
+                       (e.conditions?.fr || '') === '0' ||
+                       (e.conditions?.fr || '') === '0€',
             url: e.canonicalUrl || `https://openagenda.com/fr/${e.slug}`,
             keywords: kw,
-            image: e.image?.base || '',
+            image: e.image?.thumbnails?.['600x400'] || e.image?.base || '',
             source: agenda.name,
+            payant: !!(e.registration?.length) && !((e.conditions?.fr||'').toLowerCase().includes('gratuit')),
           });
         });
       }
