@@ -627,13 +627,20 @@ app.get('/openagenda/toulouse', async (req, res) => {
   try {
     const { dateFrom, dateTo, size = 200 } = req.query;
 
-    // IDs des principaux agendas Toulouse sur OpenAgenda
-    // On les récupère dynamiquement si pas connus
+    // Vrais UIDs des agendas Toulouse sur OpenAgenda
     const TOULOUSE_AGENDAS = [
-      { uid: 21670068, name: 'Toulouse Métropole' },
-      { uid: 49557303, name: 'Ville de Toulouse' },
-      { uid: 69703878, name: 'Toulouse Tourisme' },
-      { uid: 93814921, name: 'OpenAgenda Toulouse' },
+      { uid: 42448083,  name: 'Toulouse' },
+      { uid: 50522407,  name: 'Toulouse Métropole' },
+      { uid: 36779486,  name: 'Bibliothèques de Toulouse' },
+      { uid: 2342325,   name: 'Muséum de Toulouse' },
+      { uid: 96398684,  name: 'Zénith Toulouse' },
+      { uid: 92305987,  name: 'Opéra National du Capitole' },
+      { uid: 93202109,  name: 'Monuments de Toulouse' },
+      { uid: 2417371,   name: 'Centres culturels Toulouse' },
+      { uid: 39750428,  name: 'Sport Toulouse' },
+      { uid: 4846673,   name: 'Balma' },
+      { uid: 59938959,  name: 'Colomiers' },
+      { uid: 50781256,  name: 'Launaguet' },
     ];
 
     const params = new URLSearchParams();
