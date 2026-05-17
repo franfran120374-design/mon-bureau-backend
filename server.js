@@ -666,8 +666,10 @@ app.get('/openagenda/toulouse', async (req, res) => {
         console.log(`[OA] ${agenda.name}: ${result.value.events.length} events`);
         result.value.events.forEach(e => {
           const timing = e.timings?.[0] || {};
-          const dateStr = (timing.begin || '').split('T')[0];
-          const heure = (timing.begin || '').split('T')[1]?.substring(0,5) || '';
+          const beginStr = timing.begin || e.firstDate || e.nextDate || '';
+          const dateStr = beginStr.split('T')[0];
+          const heure = beginStr.includes('T') ? beginStr.split('T')[1]?.substring(0,5) || '' : '';
+          if (!dateStr) return; // Ignorer events sans date
           const title = e.title?.fr || e.title?.en || Object.values(e.title||{})[0] || '';
           const desc = e.description?.fr || Object.values(e.description||{})[0] || '';
           const loc = e.location || {};
