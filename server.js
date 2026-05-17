@@ -444,13 +444,14 @@ app.post('/drive/create-folder', async (req, res) => {
 
 app.post('/proxy/rss', async (req, res) => {
   try {
-    const { url, name, start, end } = req.body;
+    const { url, name } = req.body;
     if (!url) return res.status(400).json({ error: 'URL manquante' });
 
     const response = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; MonBureau/1.0)',
-        'Accept': 'application/rss+xml, application/xml, text/xml, application/json, */*'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/rss+xml, application/xml, text/xml, application/json, */*',
+        'Accept-Language': 'fr-FR,fr;q=0.9',
       },
       signal: AbortSignal.timeout(8000)
     });
@@ -458,99 +459,110 @@ app.post('/proxy/rss', async (req, res) => {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();
 
-    // Parser RSS/Atom
+    // Parser RSS/XML
     const events = [];
     const isJson = text.trim().startsWith('{') || text.trim().startsWith('[');
 
-    if (isJson) {
-      // Format JSON (OpenAgenda v2)
-      const data = JSON.parse(text);
-      const items = data.events || data.items || data.results || [];
+    if (!isJson) {
+      // Extraire items RSS ou Atom
+      const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+      const entryRe = /<entry>([\s\S]*?)<\/entry>/gi;
+      const items = [];
+      let m;
+      while ((m = itemRe.exec(text)) !== null) items.push(m[1]);
+      while ((m = entryRe.exec(text)) !== null) items.push(m[1]);
+
       items.forEach(item => {
-        const dateStr = (item.firstDate || item.date_debut || item.timings?.[0]?.begin || '').split('T')[0];
-        if (!dateStr || (start && dateStr < start) || (end && dateStr > end)) return;
-        events.push({
-          id: item.uid || item.id || Math.random().toString(36).substr(2,9),
-          title: item.title?.fr || item.title || item.nom || '',
-          description: item.description?.fr || item.description || item.descriptif || '',
-          date: dateStr,
-          heure: (item.timings?.[0]?.begin || '').split('T')[1]?.substring(0,5) || '',
-          lieu: item.location?.name || item.lieu || '',
-          adresse: item.location?.address || '',
-          commune: item.location?.city || 'Toulouse',
-          url: item.canonicalUrl || item.url || item.link || '',
-          tarif: item.registration?.[0]?.price ? `${item.registration[0].price}€` : '',
-          type: item.keywords?.fr?.[0] || item.type || '',
-          categorie: item.categories?.[0] || '',
-          source: name
-        });
-      });
-    } else {
-      // Format RSS/Atom XML — parser simple sans dépendance
-      const extractTag = (xml, tag) => {
-        const match = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\/${tag}>`, 'i'));
-        return match ? match[1].replace(/<[^>]+>/g, '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#039;/g,"'").trim() : '';
-      };
-      const extractAttr = (xml, tag, attr) => {
-        const match = xml.match(new RegExp(`<${tag}[^>]*${attr}="([^"]*)"`, 'i'));
-        return match ? match[1] : '';
-      };
+        // Extraire un tag en gérant CDATA
+        const get = (tag) => {
+          // CDATA
+          const cd = item.match(new RegExp('<' + tag + '[^>]*><!\[CDATA\[([\s\S]*?)\]\]><\/' + tag + '>', 'i'));
+          if (cd) return cd[1].trim();
+          // Texte simple
+          const tx = item.match(new RegExp('<' + tag + '[^>]*>([^<]*)<\/' + tag + '>', 'i'));
+          return tx ? tx[1].trim() : '';
+        };
+        const getAttr = (tag, attr) => {
+          const a = item.match(new RegExp('<' + tag + '[^>]*' + attr + '="([^"]*)"', 'i'));
+          return a ? a[1] : '';
+        };
 
-      // Extraire les items RSS
-      const itemMatches = [...text.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
-      const entryMatches = [...text.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)];
-      const allItems = [...itemMatches, ...entryMatches].map(m => m[1]);
+        const title = get('title');
+        if (!title) return;
 
-      allItems.forEach(item => {
-        const title = extractTag(item, 'title');
-        const link = extractTag(item, 'link') || extractAttr(item, 'link', 'href');
-        const pubDate = extractTag(item, 'pubDate') || extractTag(item, 'published') || extractTag(item, 'dc:date') || '';
-        const description = extractTag(item, 'description') || extractTag(item, 'summary') || extractTag(item, 'content');
-        
-        // Essayer d'extraire une date d'événement du contenu
+        const link = get('link') || getAttr('link', 'href') || get('guid');
+        const desc = (get('description') || get('summary') || get('content:encoded') || get('content'))
+          .replace(/<[^>]+>/g, ' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
+        const pubDate = get('pubDate') || get('published') || get('dc:date') || get('updated');
+
+        // Chercher la date de l'événement dans description/title
+        // Format : Le 23/05/2026, 23 mai 2026, 23 mai, etc.
         let dateStr = '';
-        const dateMatch = description.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-        if (dateMatch) {
-          dateStr = `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}`;
-        } else if (pubDate) {
+        
+        // Format DD/MM/YYYY
+        const dm1 = desc.match(/(?:le\s+)?(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/i);
+        if (dm1) dateStr = `${dm1[3]}-${dm1[2].padStart(2,'0')}-${dm1[1].padStart(2,'0')}`;
+        
+        // Format "23 mai 2026" ou "23 mai"
+        if (!dateStr) {
+          const mois = {janvier:'01',février:'02',mars:'03',avril:'04',mai:'05',juin:'06',juillet:'07',août:'08',septembre:'09',octobre:'10',novembre:'11',décembre:'12'};
+          const dm2 = (title + ' ' + desc).match(/(\d{1,2})\s+(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s*(\d{4})?/i);
+          if (dm2) {
+            const year = dm2[3] || new Date().getFullYear().toString();
+            dateStr = `${year}-${mois[dm2[2].toLowerCase()]}-${dm2[1].padStart(2,'0')}`;
+          }
+        }
+
+        // Format YYYY-MM-DD dans la description
+        if (!dateStr) {
+          const dm3 = desc.match(/(\d{4})-(\d{2})-(\d{2})/);
+          if (dm3) dateStr = `${dm3[1]}-${dm3[2]}-${dm3[3]}`;
+        }
+
+        // Fallback : date de publication
+        if (!dateStr && pubDate) {
           try { dateStr = new Date(pubDate).toISOString().split('T')[0]; } catch(e) {}
         }
 
-        if (!title || !dateStr) return;
-        if (start && dateStr < start) return;
-        if (end && dateStr > end) return;
+        if (!dateStr) return;
 
-        // Extraire l'heure du contenu
-        const heureMatch = description.match(/(\d{1,2})[h:](\d{2})/i);
-        const heure = heureMatch ? `${heureMatch[1].padStart(2,'0')}:${heureMatch[2]}` : '';
+        // Heure
+        const hm = (title + ' ' + desc).match(/(\d{1,2})[h:](\d{2})/i);
+        const heure = hm ? `${hm[1].padStart(2,'0')}:${hm[2]}` : '';
 
-        // Extraire lieu et tarif du contenu
-        const lieuMatch = description.match(/lieu[^:]{0,5}:([^<,]{3,40})/i);
-        const tarifMatch = description.match(/tarif[^:]{0,5}:([^<]{3,30})/i);
+        // Tarif
+        const isFree = /gratuit|entrée libre|libre|sans inscription/i.test(title + ' ' + desc);
+        const tarifM = desc.match(/(\d+)\s*€/);
+        const tarif = isFree ? 'Gratuit' : (tarifM ? tarifM[0] : '');
 
         events.push({
-          id: link || Math.random().toString(36).substr(2,9),
-          title: title.substring(0, 120),
-          description: description.replace(/<[^>]+>/g,'').substring(0, 200),
+          id: link || title + dateStr,
+          title: title.substring(0, 150),
+          description: desc.substring(0, 250),
           date: dateStr,
           heure,
-          lieu: lieuMatch?.[1]?.trim() || '',
+          horaires: heure ? `${dateStr} à ${heure}` : dateStr,
+          lieu: '',
           adresse: '',
           commune: 'Toulouse',
           url: link,
-          tarif: tarifMatch?.[1]?.trim() || '',
-          type: 'Événement',
+          tarif,
+          isGratuit: isFree,
+          type: '',
           categorie: '',
           source: name
         });
       });
     }
 
-    console.log(`[RSS Proxy] ${name}: ${events.length} events parsés`);
+    // Trier par date
+    events.sort((a, b) => (a.date||'').localeCompare(b.date||''));
+
+    console.log('[RSS Proxy]', name + ':', events.length, 'events, url:', url.substring(0,60));
     res.json({ events, source: name, total: events.length });
 
   } catch (error) {
-    console.error('[RSS Proxy] Erreur:', error.message);
+    console.error('[RSS Proxy] Erreur:', name, error.message);
     res.status(500).json({ error: error.message, events: [] });
   }
 });
