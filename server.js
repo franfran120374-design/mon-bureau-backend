@@ -439,6 +439,125 @@ app.post('/drive/create-folder', async (req, res) => {
 });
 
 // =================
+// PROXY RSS ÉVÉNEMENTS TOULOUSE
+// =================
+
+app.post('/proxy/rss', async (req, res) => {
+  try {
+    const { url, name, start, end } = req.body;
+    if (!url) return res.status(400).json({ error: 'URL manquante' });
+
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; MonBureau/1.0)',
+        'Accept': 'application/rss+xml, application/xml, text/xml, application/json, */*'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = await response.text();
+
+    // Parser RSS/Atom
+    const events = [];
+    const isJson = text.trim().startsWith('{') || text.trim().startsWith('[');
+
+    if (isJson) {
+      // Format JSON (OpenAgenda v2)
+      const data = JSON.parse(text);
+      const items = data.events || data.items || data.results || [];
+      items.forEach(item => {
+        const dateStr = (item.firstDate || item.date_debut || item.timings?.[0]?.begin || '').split('T')[0];
+        if (!dateStr || (start && dateStr < start) || (end && dateStr > end)) return;
+        events.push({
+          id: item.uid || item.id || Math.random().toString(36).substr(2,9),
+          title: item.title?.fr || item.title || item.nom || '',
+          description: item.description?.fr || item.description || item.descriptif || '',
+          date: dateStr,
+          heure: (item.timings?.[0]?.begin || '').split('T')[1]?.substring(0,5) || '',
+          lieu: item.location?.name || item.lieu || '',
+          adresse: item.location?.address || '',
+          commune: item.location?.city || 'Toulouse',
+          url: item.canonicalUrl || item.url || item.link || '',
+          tarif: item.registration?.[0]?.price ? `${item.registration[0].price}€` : '',
+          type: item.keywords?.fr?.[0] || item.type || '',
+          categorie: item.categories?.[0] || '',
+          source: name
+        });
+      });
+    } else {
+      // Format RSS/Atom XML — parser simple sans dépendance
+      const extractTag = (xml, tag) => {
+        const match = xml.match(new RegExp(`<${tag}[^>]*>([\s\S]*?)<\/${tag}>`, 'i'));
+        return match ? match[1].replace(/<[^>]+>/g, '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#039;/g,"'").trim() : '';
+      };
+      const extractAttr = (xml, tag, attr) => {
+        const match = xml.match(new RegExp(`<${tag}[^>]*${attr}="([^"]*)"`, 'i'));
+        return match ? match[1] : '';
+      };
+
+      // Extraire les items RSS
+      const itemMatches = [...text.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
+      const entryMatches = [...text.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)];
+      const allItems = [...itemMatches, ...entryMatches].map(m => m[1]);
+
+      allItems.forEach(item => {
+        const title = extractTag(item, 'title');
+        const link = extractTag(item, 'link') || extractAttr(item, 'link', 'href');
+        const pubDate = extractTag(item, 'pubDate') || extractTag(item, 'published') || extractTag(item, 'dc:date') || '';
+        const description = extractTag(item, 'description') || extractTag(item, 'summary') || extractTag(item, 'content');
+        
+        // Essayer d'extraire une date d'événement du contenu
+        let dateStr = '';
+        const dateMatch = description.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+        if (dateMatch) {
+          dateStr = `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}`;
+        } else if (pubDate) {
+          try { dateStr = new Date(pubDate).toISOString().split('T')[0]; } catch(e) {}
+        }
+
+        if (!title || !dateStr) return;
+        if (start && dateStr < start) return;
+        if (end && dateStr > end) return;
+
+        // Extraire l'heure du contenu
+        const heureMatch = description.match(/(\d{1,2})[h:](\d{2})/i);
+        const heure = heureMatch ? `${heureMatch[1].padStart(2,'0')}:${heureMatch[2]}` : '';
+
+        // Extraire lieu et tarif du contenu
+        const lieuMatch = description.match(/(?:lieu|salle|à)\s*:?\s*([^<
+,]{3,40})/i);
+        const tarifMatch = description.match(/(?:tarif|prix|entrée)\s*:?\s*([^<
+]{3,30})/i);
+
+        events.push({
+          id: link || Math.random().toString(36).substr(2,9),
+          title: title.substring(0, 120),
+          description: description.replace(/<[^>]+>/g,'').substring(0, 200),
+          date: dateStr,
+          heure,
+          lieu: lieuMatch?.[1]?.trim() || '',
+          adresse: '',
+          commune: 'Toulouse',
+          url: link,
+          tarif: tarifMatch?.[1]?.trim() || '',
+          type: 'Événement',
+          categorie: '',
+          source: name
+        });
+      });
+    }
+
+    console.log(`[RSS Proxy] ${name}: ${events.length} events parsés`);
+    res.json({ events, source: name, total: events.length });
+
+  } catch (error) {
+    console.error('[RSS Proxy] Erreur:', error.message);
+    res.status(500).json({ error: error.message, events: [] });
+  }
+});
+
+// =================
 // HEALTH
 // =================
 
