@@ -488,7 +488,7 @@ app.post('/proxy/rss', async (req, res) => {
     } else {
       // Format RSS/Atom XML — parser simple sans dépendance
       const extractTag = (xml, tag) => {
-        const match = xml.match(new RegExp(`<${tag}[^>]*>([\s\S]*?)<\/${tag}>`, 'i'));
+        const match = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\/${tag}>`, 'i'));
         return match ? match[1].replace(/<[^>]+>/g, '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#039;/g,"'").trim() : '';
       };
       const extractAttr = (xml, tag, attr) => {
@@ -525,9 +525,9 @@ app.post('/proxy/rss', async (req, res) => {
         const heure = heureMatch ? `${heureMatch[1].padStart(2,'0')}:${heureMatch[2]}` : '';
 
         // Extraire lieu et tarif du contenu
-        const lieuMatch = description.match(/(?:lieu|salle|à)\s*:?\s*([^<
+        const lieuMatch = description.match(/(?:lieu|salle)[^:]{0,5}:?\s*([^<,\n]{3,40})/i);
 ,]{3,40})/i);
-        const tarifMatch = description.match(/(?:tarif|prix|entrée)\s*:?\s*([^<
+        const tarifMatch = description.match(/(?:tarif|prix|billet)[^:]{0,5}:?\s*([^<\n]{3,30})/i);
 ]{3,30})/i);
 
         events.push({
