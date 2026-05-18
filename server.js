@@ -154,6 +154,71 @@ app.post('/claude/analyze', async (req, res) => {
 });
 
 // =================
+// AGENTS IA - Endpoint universel pour tous les agents
+// =================
+
+app.post('/agents/chat', async (req, res) => {
+  try {
+    const { messages, system, mcpServers } = req.body;
+    
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Messages array is required' 
+      });
+    }
+
+    // Configuration de base pour l'API
+    const config = {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      messages: messages
+    };
+
+    // Ajouter le system prompt si fourni
+    if (system) {
+      config.system = system;
+    }
+
+    // Ajouter les MCP servers si fournis
+    if (mcpServers && Array.isArray(mcpServers) && mcpServers.length > 0) {
+      config.mcp_servers = mcpServers;
+    }
+
+    console.log('[Agents] Request:', {
+      messageCount: messages.length,
+      hasSystem: !!system,
+      mcpCount: mcpServers?.length || 0
+    });
+
+    // Appel à l'API Anthropic
+    const message = await anthropic.messages.create(config);
+
+    console.log('[Agents] Response:', {
+      contentBlocks: message.content.length,
+      usage: message.usage
+    });
+
+    // Retourner la réponse complète (incluant les tool_use/tool_result si présents)
+    res.json({ 
+      success: true, 
+      content: message.content,
+      usage: message.usage,
+      model: message.model,
+      stop_reason: message.stop_reason
+    });
+
+  } catch (error) {
+    console.error('[Agents] Error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      details: error.error?.message || error.toString()
+    });
+  }
+});
+
+// =================
 // PROXY GOOGLE MAPS (Directions API - évite CORS)
 // =================
 
