@@ -625,9 +625,9 @@ app.get('/openagenda/events', async (req, res) => {
 // Route combinée : tous les agendas Toulouse en une fois
 app.get('/openagenda/toulouse', async (req, res) => {
   try {
-    const { dateFrom, dateTo, size = 200 } = req.query;
+    const { dateFrom, dateTo, size = 100 } = req.query;
+    console.log('[OA/toulouse] dateFrom:', dateFrom, 'dateTo:', dateTo);
 
-    // Vrais UIDs des agendas Toulouse sur OpenAgenda
     const TOULOUSE_AGENDAS = [
       { uid: 42448083,  name: 'Toulouse' },
       { uid: 50522407,  name: 'Toulouse Métropole' },
@@ -643,24 +643,31 @@ app.get('/openagenda/toulouse', async (req, res) => {
       { uid: 50781256,  name: 'Launaguet' },
     ];
 
-    // Construire l'URL manuellement pour les paramètres avec crochets
+    // Tester d'abord un seul agenda pour debugger
+    const testUrl = `https://api.openagenda.com/v2/agendas/42448083/events?size=3&key=${OA_KEY}`;
+    const testResp = await fetch(testUrl, { signal: AbortSignal.timeout(8000) });
+    console.log('[OA/toulouse] Test agenda 42448083:', testResp.status);
+    const testData = testResp.ok ? await testResp.json() : null;
+    console.log('[OA/toulouse] Test events:', testData?.events?.length, testData?.error);
+
+    // Construction URL avec timings
     const buildUrl = (uid) => {
-      let url = `https://api.openagenda.com/v2/agendas/${uid}/events?size=${size}&sort=timings.start`;
-      if (dateFrom) url += `&timings[gte]=${encodeURIComponent(dateFrom + 'T00:00:00')}`;
-      if (dateTo) url += `&timings[lte]=${encodeURIComponent(dateTo + 'T23:59:59')}`;
+      let url = `https://api.openagenda.com/v2/agendas/${uid}/events?size=${size}&key=${OA_KEY}`;
+      if (dateFrom) url += `&timings[gte]=${dateFrom}T00:00:00`;
+      if (dateTo) url += `&timings[lte]=${dateTo}T23:59:59`;
       return url;
     };
 
-    // Chercher dans plusieurs agendas en parallèle
+    // Chercher dans plusieurs agendas séquentiellement pour éviter rate limit
     const results = await Promise.allSettled(
       TOULOUSE_AGENDAS.map(agenda =>
         fetch(buildUrl(agenda.uid), {
-          headers: { 'key': OA_KEY },
-          signal: AbortSignal.timeout(8000)
+          signal: AbortSignal.timeout(10000)
         }).then(r => {
-          if (!r.ok) { console.warn(`[OA] ${agenda.name} HTTP ${r.status}`); return null; }
+          console.log(`[OA] ${agenda.name}: HTTP ${r.status}`);
+          if (!r.ok) return null;
           return r.json();
-        }).catch(e => { console.warn(`[OA] ${agenda.name} erreur:`, e.message); return null; })
+        }).catch(e => { console.warn(`[OA] ${agenda.name} err:`, e.message); return null; })
       )
     );
 
@@ -671,11 +678,13 @@ app.get('/openagenda/toulouse', async (req, res) => {
         console.log(`[OA] ${agenda.name}: ${result.value.events.length} events`);
         result.value.events.forEach(e => {
           const timing = e.timings?.[0] || {};
-          const beginStr = timing.begin || e.firstDate || e.nextDate || '';
-          const dateStr = beginStr.split('T')[0];
-          const heure = beginStr.includes('T') ? beginStr.split('T')[1]?.substring(0,5) || '' : '';
-          if (!dateStr) return; // Ignorer events sans date
+          // OpenAgenda v2 : les dates sont dans timing.begin (ISO) ou firstDate
+          // Format possible : "2026-05-18T20:00:00+02:00" ou "2026-05-18T20:00:00Z" ou "2026-05-18"
+          const beginRaw = timing.begin || timing.start || e.firstDate || e.nextDate || '';
+          const dateStr = beginRaw ? beginRaw.substring(0, 10) : '';
+          const heure = beginRaw && beginRaw.length > 10 ? beginRaw.substring(11, 16) : '';
           const title = e.title?.fr || e.title?.en || Object.values(e.title||{})[0] || '';
+          if (!title) return; // Ignorer events sans titre (pas de filtre sur dateStr)
           const desc = e.description?.fr || Object.values(e.description||{})[0] || '';
           const loc = e.location || {};
           const kw = (e.keywords?.fr || []).concat(e.keywords?.en || []).join(' ');
