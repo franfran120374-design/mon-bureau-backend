@@ -159,7 +159,7 @@ app.post('/claude/analyze', async (req, res) => {
 
 app.post('/agents/chat', async (req, res) => {
   try {
-    const { messages, system, mcpServers } = req.body;
+    const { messages, system } = req.body;
     
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ 
@@ -180,18 +180,12 @@ app.post('/agents/chat', async (req, res) => {
       config.system = system;
     }
 
-    // Ajouter les MCP servers si fournis
-    if (mcpServers && Array.isArray(mcpServers) && mcpServers.length > 0) {
-      config.mcp_servers = mcpServers;
-    }
-
     console.log('[Agents] Request:', {
       messageCount: messages.length,
-      hasSystem: !!system,
-      mcpCount: mcpServers?.length || 0
+      hasSystem: !!system
     });
 
-    // Appel à l'API Anthropic
+    // Appel à l'API Anthropic (sans MCP servers - non supporté par l'API standard)
     const message = await anthropic.messages.create(config);
 
     console.log('[Agents] Response:', {
@@ -199,7 +193,7 @@ app.post('/agents/chat', async (req, res) => {
       usage: message.usage
     });
 
-    // Retourner la réponse complète (incluant les tool_use/tool_result si présents)
+    // Retourner la réponse complète
     res.json({ 
       success: true, 
       content: message.content,
