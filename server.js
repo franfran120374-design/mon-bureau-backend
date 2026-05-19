@@ -33,7 +33,6 @@ const oauth2Client = new google.auth.OAuth2(
 const SCOPES = [
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/drive',
-  'https://www.googleapis.com/auth/gmail.modify',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
   'https://www.googleapis.com/auth/contacts.readonly'  // ← People API pour les contacts
@@ -155,553 +154,6 @@ app.post('/claude/analyze', async (req, res) => {
 });
 
 // =================
-// AGENTS IA - Endpoint universel pour tous les agents
-// =================
-
-app.post('/agents/chat', async (req, res) => {
-  try {
-    const { messages, system } = req.body;
-    
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Messages array is required' 
-      });
-    }
-
-    // Configuration de base pour l'API
-    const config = {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      messages: messages
-    };
-
-    // Ajouter le system prompt si fourni
-    if (system) {
-      config.system = system;
-    }
-
-    console.log('[Agents] Request:', {
-      messageCount: messages.length,
-      hasSystem: !!system
-    });
-
-    // Appel à l'API Anthropic (sans MCP servers - non supporté par l'API standard)
-    const message = await anthropic.messages.create(config);
-
-    console.log('[Agents] Response:', {
-      contentBlocks: message.content.length,
-      usage: message.usage
-    });
-
-    // Retourner la réponse complète
-    res.json({ 
-      success: true, 
-      content: message.content,
-      usage: message.usage,
-      model: message.model,
-      stop_reason: message.stop_reason
-    });
-
-  } catch (error) {
-    console.error('[Agents] Error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message,
-      details: error.error?.message || error.toString()
-    });
-  }
-});
-
-// =================
-// ENDPOINTS PROXY POUR LES AGENTS IA
-// À ajouter dans server.js après les routes Claude existantes
-// =================
-
-// Middleware pour vérifier le token Google et le rafraîchir si nécessaire
-async function refreshGoogleToken(tokens) {
-  oauth2Client.setCredentials(tokens);
-  if (oauth2Client.credentials.expiry_date && oauth2Client.credentials.expiry_date < Date.now()) {
-    const { credentials } = await oauth2Client.refreshAccessToken();
-    return credentials;
-  }
-  return tokens;
-}
-
-// =================
-// SPOTIFY PROXY POUR AGENTS
-// =================
-
-app.post('/agents/spotify/search', async (req, res) => {
-  try {
-    const { query, type = 'track', limit = 10, accessToken } = req.body;
-    
-    if (!accessToken) {
-      return res.status(401).json({ success: false, error: 'Spotify access token required' });
-    }
-
-    const params = new URLSearchParams({
-      q: query,
-      type: type,
-      limit: limit.toString(),
-      market: 'FR'
-    });
-
-    const response = await fetch(`https://api.spotify.com/v1/search?${params}`, {
-      headers: {
-        'Authorization': `Bearer ${accessToken}`
-      }
-    });
-
-    const data = await response.json();
-    
-    if (!response.ok) {
-      throw new Error(data.error?.message || 'Spotify API error');
-    }
-
-    console.log('[Agent-Spotify] Search:', query, '→', data.tracks?.items?.length || 0, 'results');
-    res.json({ success: true, data });
-  } catch (error) {
-    console.error('[Agent-Spotify] Search error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/agents/spotify/create-playlist', async (req, res) => {
-  try {
-    const { name, description, trackUris, accessToken, userId } = req.body;
-    
-    if (!accessToken || !userId) {
-      return res.status(401).json({ success: false, error: 'Spotify credentials required' });
-    }
-
-    // Créer la playlist
-    const createResponse = await fetch(`https://api.spotify.com/v1/users/${userId}/playlists`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        name,
-        description: description || 'Créée par Mon Bureau AI',
-        public: false
-      })
-    });
-
-    const playlist = await createResponse.json();
-    
-    if (!createResponse.ok) {
-      throw new Error(playlist.error?.message || 'Failed to create playlist');
-    }
-
-    // Ajouter les tracks si fournis
-    if (trackUris && trackUris.length > 0) {
-      const addResponse = await fetch(`https://api.spotify.com/v1/playlists/${playlist.id}/tracks`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          uris: trackUris
-        })
-      });
-
-      if (!addResponse.ok) {
-        console.warn('[Agent-Spotify] Failed to add tracks to playlist');
-      }
-    }
-
-    console.log('[Agent-Spotify] Playlist created:', playlist.name, playlist.external_urls.spotify);
-    res.json({ 
-      success: true, 
-      playlist: {
-        id: playlist.id,
-        name: playlist.name,
-        url: playlist.external_urls.spotify,
-        tracks: trackUris?.length || 0
-      }
-    });
-  } catch (error) {
-    console.error('[Agent-Spotify] Create playlist error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/agents/spotify/recommendations', async (req, res) => {
-  try {
-    const { seedArtists, seedTracks, seedGenres, limit = 20, accessToken } = req.body;
-    
-    if (!accessToken) {
-      return res.status(401).json({ success: false, error: 'Spotify access token required' });
-    }
-
-    const params = new URLSearchParams({
-      limit: limit.toString(),
-      market: 'FR'
-    });
-
-    if (seedArtists?.length) params.append('seed_artists', seedArtists.join(','));
-    if (seedTracks?.length) params.append('seed_tracks', seedTracks.join(','));
-    if (seedGenres?.length) params.append('seed_genres', seedGenres.join(','));
-
-    const response = await fetch(`https://api.spotify.com/v1/recommendations?${params}`, {
-      headers: {
-        'Authorization': `Bearer ${accessToken}`
-      }
-    });
-
-    const data = await response.json();
-    
-    if (!response.ok) {
-      throw new Error(data.error?.message || 'Spotify API error');
-    }
-
-    console.log('[Agent-Spotify] Recommendations:', data.tracks?.length || 0, 'tracks');
-    res.json({ success: true, data });
-  } catch (error) {
-    console.error('[Agent-Spotify] Recommendations error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// =================
-// GOOGLE CALENDAR PROXY POUR AGENTS
-// =================
-
-app.post('/agents/calendar/list-events', async (req, res) => {
-  try {
-    const { tokens, maxResults = 10, timeMin, timeMax } = req.body;
-    
-    if (!tokens) {
-      return res.status(401).json({ success: false, error: 'Google tokens required' });
-    }
-
-    const refreshedTokens = await refreshGoogleToken(tokens);
-    oauth2Client.setCredentials(refreshedTokens);
-
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-    const params = {
-      calendarId: 'primary',
-      maxResults,
-      singleEvents: true,
-      orderBy: 'startTime'
-    };
-
-    if (timeMin) params.timeMin = timeMin;
-    if (timeMax) params.timeMax = timeMax;
-
-    const response = await calendar.events.list(params);
-    const events = response.data.items || [];
-
-    console.log('[Agent-Calendar] Listed:', events.length, 'events');
-    res.json({ 
-      success: true, 
-      events: events.map(e => ({
-        id: e.id,
-        summary: e.summary,
-        start: e.start?.dateTime || e.start?.date,
-        end: e.end?.dateTime || e.end?.date,
-        location: e.location,
-        description: e.description,
-        attendees: e.attendees?.map(a => a.email)
-      })),
-      tokens: refreshedTokens
-    });
-  } catch (error) {
-    console.error('[Agent-Calendar] List error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/agents/calendar/create-event', async (req, res) => {
-  try {
-    const { tokens, summary, description, start, end, location, attendees } = req.body;
-    
-    if (!tokens || !summary || !start || !end) {
-      return res.status(400).json({ success: false, error: 'Missing required fields' });
-    }
-
-    const refreshedTokens = await refreshGoogleToken(tokens);
-    oauth2Client.setCredentials(refreshedTokens);
-
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-    const event = {
-      summary,
-      description,
-      start: { dateTime: start, timeZone: 'Europe/Paris' },
-      end: { dateTime: end, timeZone: 'Europe/Paris' }
-    };
-
-    if (location) event.location = location;
-    if (attendees?.length) event.attendees = attendees.map(email => ({ email }));
-
-    const response = await calendar.events.insert({
-      calendarId: 'primary',
-      requestBody: event
-    });
-
-    console.log('[Agent-Calendar] Event created:', response.data.summary);
-    res.json({ 
-      success: true, 
-      event: {
-        id: response.data.id,
-        summary: response.data.summary,
-        htmlLink: response.data.htmlLink,
-        start: response.data.start?.dateTime
-      },
-      tokens: refreshedTokens
-    });
-  } catch (error) {
-    console.error('[Agent-Calendar] Create error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/agents/calendar/find-free-time', async (req, res) => {
-  try {
-    const { tokens, timeMin, timeMax, duration = 60 } = req.body;
-    
-    if (!tokens || !timeMin || !timeMax) {
-      return res.status(400).json({ success: false, error: 'Missing required fields' });
-    }
-
-    const refreshedTokens = await refreshGoogleToken(tokens);
-    oauth2Client.setCredentials(refreshedTokens);
-
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-    const response = await calendar.freebusy.query({
-      requestBody: {
-        timeMin,
-        timeMax,
-        items: [{ id: 'primary' }]
-      }
-    });
-
-    const busy = response.data.calendars?.primary?.busy || [];
-    
-    // Calculer les créneaux libres
-    const freeSlots = [];
-    let currentTime = new Date(timeMin);
-    const endTime = new Date(timeMax);
-
-    busy.forEach((busyPeriod, index) => {
-      const busyStart = new Date(busyPeriod.start);
-      const busyEnd = new Date(busyPeriod.end);
-      
-      // Créneau libre avant ce busy period
-      if (currentTime < busyStart) {
-        const slotDuration = (busyStart - currentTime) / (1000 * 60);
-        if (slotDuration >= duration) {
-          freeSlots.push({
-            start: currentTime.toISOString(),
-            end: busyStart.toISOString(),
-            duration: Math.floor(slotDuration)
-          });
-        }
-      }
-      currentTime = busyEnd;
-    });
-
-    // Dernier créneau libre
-    if (currentTime < endTime) {
-      const slotDuration = (endTime - currentTime) / (1000 * 60);
-      if (slotDuration >= duration) {
-        freeSlots.push({
-          start: currentTime.toISOString(),
-          end: endTime.toISOString(),
-          duration: Math.floor(slotDuration)
-        });
-      }
-    }
-
-    console.log('[Agent-Calendar] Found:', freeSlots.length, 'free slots');
-    res.json({ success: true, freeSlots, tokens: refreshedTokens });
-  } catch (error) {
-    console.error('[Agent-Calendar] Free time error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// =================
-// GMAIL PROXY POUR AGENTS
-// =================
-
-app.post('/agents/gmail/list-messages', async (req, res) => {
-  try {
-    const { tokens, maxResults = 10, query = '', labelIds = ['INBOX'] } = req.body;
-    
-    if (!tokens) {
-      return res.status(401).json({ success: false, error: 'Google tokens required' });
-    }
-
-    const refreshedTokens = await refreshGoogleToken(tokens);
-    oauth2Client.setCredentials(refreshedTokens);
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    const response = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults,
-      q: query,
-      labelIds
-    });
-
-    const messages = response.data.messages || [];
-    
-    // Récupérer les détails de chaque message
-    const detailedMessages = await Promise.all(
-      messages.slice(0, maxResults).map(async (msg) => {
-        const detail = await gmail.users.messages.get({
-          userId: 'me',
-          id: msg.id,
-          format: 'metadata',
-          metadataHeaders: ['From', 'To', 'Subject', 'Date']
-        });
-        
-        const headers = detail.data.payload.headers;
-        return {
-          id: msg.id,
-          threadId: msg.threadId,
-          from: headers.find(h => h.name === 'From')?.value,
-          to: headers.find(h => h.name === 'To')?.value,
-          subject: headers.find(h => h.name === 'Subject')?.value,
-          date: headers.find(h => h.name === 'Date')?.value,
-          snippet: detail.data.snippet
-        };
-      })
-    );
-
-    console.log('[Agent-Gmail] Listed:', detailedMessages.length, 'messages');
-    res.json({ success: true, messages: detailedMessages, tokens: refreshedTokens });
-  } catch (error) {
-    console.error('[Agent-Gmail] List error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/agents/gmail/send-message', async (req, res) => {
-  try {
-    const { tokens, to, subject, body, cc, bcc } = req.body;
-    
-    if (!tokens || !to || !subject || !body) {
-      return res.status(400).json({ success: false, error: 'Missing required fields' });
-    }
-
-    const refreshedTokens = await refreshGoogleToken(tokens);
-    oauth2Client.setCredentials(refreshedTokens);
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    // Construire le message au format RFC 2822
-    let message = [
-      `To: ${to}`,
-      `Subject: ${subject}`,
-    ];
-    
-    if (cc) message.push(`Cc: ${cc}`);
-    if (bcc) message.push(`Bcc: ${bcc}`);
-    
-    message.push('Content-Type: text/html; charset=utf-8');
-    message.push('');
-    message.push(body);
-
-    const encodedMessage = Buffer.from(message.join('\n'))
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-
-    const response = await gmail.users.messages.send({
-      userId: 'me',
-      requestBody: {
-        raw: encodedMessage
-      }
-    });
-
-    console.log('[Agent-Gmail] Message sent:', response.data.id);
-    res.json({ 
-      success: true, 
-      messageId: response.data.id,
-      tokens: refreshedTokens
-    });
-  } catch (error) {
-    console.error('[Agent-Gmail] Send error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// =================
-// LAST.FM PROXY (pas d'auth nécessaire)
-// =================
-
-app.get('/agents/lastfm/:method', async (req, res) => {
-  try {
-    const { method } = req.params;
-    const LASTFM_API_KEY = '58c198bcc66ba74924848228a2fa6935';
-    const LASTFM_USER = 'franfran120374';
-    
-    const params = new URLSearchParams({
-      method: `user.${method}`,
-      user: LASTFM_USER,
-      api_key: LASTFM_API_KEY,
-      format: 'json',
-      limit: req.query.limit || '10',
-      period: req.query.period || 'overall'
-    });
-
-    const response = await fetch(`http://ws.audioscrobbler.com/2.0/?${params}`);
-    const data = await response.json();
-
-    if (data.error) {
-      throw new Error(data.message);
-    }
-
-    console.log('[Agent-LastFM]', method, '→', Object.keys(data)[0]);
-    res.json({ success: true, data });
-  } catch (error) {
-    console.error('[Agent-LastFM] Error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// =================
-// YOUTUBE PROXY (pas d'auth nécessaire)
-// =================
-
-app.get('/agents/youtube/search', async (req, res) => {
-  try {
-    const YOUTUBE_API_KEY = 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
-    
-    const params = new URLSearchParams({
-      part: 'snippet',
-      q: req.query.q,
-      type: 'video',
-      maxResults: req.query.maxResults || '5',
-      key: YOUTUBE_API_KEY
-    });
-
-    const response = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
-    const data = await response.json();
-
-    if (data.error) {
-      throw new Error(data.error.message);
-    }
-
-    console.log('[Agent-YouTube] Search:', req.query.q, '→', data.items?.length, 'videos');
-    res.json({ success: true, data });
-  } catch (error) {
-    console.error('[Agent-YouTube] Error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-
-// =================
 // PROXY GOOGLE MAPS (Directions API - évite CORS)
 // =================
 
@@ -735,6 +187,166 @@ app.post('/proxy/maps', async (req, res) => {
   } catch (error) {
     console.error('Maps proxy error:', error);
     res.status(500).json({ error: error.message, status: 'ERROR' });
+  }
+});
+
+
+// =================
+// TRAJETS & RAPPELS DE DÉPART
+// =================
+
+const HOME_ADDRESS = '10 rue Etienne Bacquié, Toulouse';
+const DEFAULT_PREP_MINUTES = 10;
+
+app.post('/maps/trajet', async (req, res) => {
+  try {
+    const { destination, arrivalTime, mode = 'transit', prepMinutes = DEFAULT_PREP_MINUTES } = req.body;
+    const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
+
+    if (!destination) return res.status(400).json({ success: false, error: 'Destination requise' });
+
+    const arrivalTimestamp = arrivalTime
+      ? Math.floor(new Date(arrivalTime).getTime() / 1000)
+      : Math.floor(Date.now() / 1000 + 3600);
+
+    const params = new URLSearchParams({
+      origin: HOME_ADDRESS,
+      destination,
+      mode,
+      arrival_time: arrivalTimestamp,
+      key: MAPS_KEY,
+      language: 'fr',
+      region: 'fr'
+    });
+
+    let data = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`).then(r => r.json());
+
+    // Fallback sans arrival_time (driving ne le supporte pas)
+    if (data.status !== 'OK') {
+      const params2 = new URLSearchParams({
+        origin: HOME_ADDRESS, destination, mode,
+        departure_time: 'now', key: MAPS_KEY, language: 'fr', region: 'fr'
+      });
+      data = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params2}`).then(r => r.json());
+    }
+
+    const leg = data.routes?.[0]?.legs?.[0];
+    if (!leg) return res.json({ success: false, error: `Maps: ${data.status} - ${data.error_message || ''}` });
+
+    const durationMinutes = Math.ceil((leg.duration_in_traffic?.value || leg.duration?.value || 0) / 60);
+    const durationText = leg.duration_in_traffic?.text || leg.duration?.text || `${durationMinutes} min`;
+
+    let rappel = null;
+    if (arrivalTime) {
+      const departureMs = new Date(arrivalTime).getTime() - (durationMinutes + prepMinutes) * 60000;
+      const departureTime = new Date(departureMs);
+      const minutesUntilDeparture = Math.round((departureMs - Date.now()) / 60000);
+      const departureText = departureTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
+
+      rappel = {
+        departureTime: departureTime.toISOString(),
+        departureText,
+        minutesUntilDeparture,
+        prepMinutes,
+        message: minutesUntilDeparture > 0
+          ? `Pars dans ${minutesUntilDeparture} min (à ${departureText})`
+          : minutesUntilDeparture === 0 ? 'Pars maintenant !'
+          : `Tu aurais dû partir il y a ${Math.abs(minutesUntilDeparture)} min`,
+        isUrgent: minutesUntilDeparture >= 0 && minutesUntilDeparture <= 15,
+        isLate: minutesUntilDeparture < 0
+      };
+    }
+
+    const steps = (leg.steps || []).slice(0, 5).map(s => ({
+      instruction: (s.html_instructions || '').replace(/<[^>]+>/g, ''),
+      duration: s.duration?.text || '',
+      distance: s.distance?.text || '',
+      mode: s.travel_mode?.toLowerCase() || mode,
+      transit: s.transit_details ? {
+        line: s.transit_details.line?.short_name || s.transit_details.line?.name || '',
+        from: s.transit_details.departure_stop?.name || '',
+        to: s.transit_details.arrival_stop?.name || ''
+      } : null
+    }));
+
+    console.log(`[Maps/Trajet] ${destination}: ${durationText}, départ: ${rappel?.departureText || 'N/A'}`);
+    res.json({
+      success: true,
+      trajet: {
+        origin: HOME_ADDRESS,
+        destination: leg.end_address || destination,
+        duration: durationText,
+        durationMinutes,
+        distance: leg.distance?.text || '',
+        mode,
+        steps,
+        mapsLink: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(HOME_ADDRESS)}&destination=${encodeURIComponent(destination)}&travelmode=${mode}`
+      },
+      rappel
+    });
+
+  } catch (error) {
+    console.error('[Maps/Trajet] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/maps/trajets-agenda', async (req, res) => {
+  try {
+    const { events, prepMinutes = DEFAULT_PREP_MINUTES } = req.body;
+    if (!events?.length) return res.json({ success: true, trajets: [] });
+
+    const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
+    const withLocation = events.filter(e => e.location?.trim()).slice(0, 5);
+
+    const results = await Promise.allSettled(withLocation.map(async (event) => {
+      const params = new URLSearchParams({
+        origin: HOME_ADDRESS,
+        destination: event.location,
+        mode: 'transit',
+        language: 'fr',
+        region: 'fr',
+        key: MAPS_KEY
+      });
+      if (event.start) params.set('arrival_time', Math.floor(new Date(event.start).getTime() / 1000));
+
+      const data = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`).then(r => r.json());
+      const leg = data.routes?.[0]?.legs?.[0];
+      if (!leg) return null;
+
+      const durationMinutes = Math.ceil((leg.duration?.value || 0) / 60);
+      let departureTime = null, minutesUntilDeparture = null, departureText = '';
+
+      if (event.start) {
+        const departureMs = new Date(event.start).getTime() - (durationMinutes + prepMinutes) * 60000;
+        departureTime = new Date(departureMs);
+        minutesUntilDeparture = Math.round((departureMs - Date.now()) / 60000);
+        departureText = departureTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
+      }
+
+      return {
+        eventId: event.id,
+        eventTitle: event.summary || event.title || '',
+        destination: event.location,
+        duration: leg.duration?.text,
+        durationMinutes,
+        distance: leg.distance?.text,
+        mapsLink: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(HOME_ADDRESS)}&destination=${encodeURIComponent(event.location)}&travelmode=transit`,
+        departureTime: departureTime?.toISOString(),
+        departureText,
+        minutesUntilDeparture,
+        isUrgent: minutesUntilDeparture !== null && minutesUntilDeparture >= 0 && minutesUntilDeparture <= 15,
+        isLate: minutesUntilDeparture !== null && minutesUntilDeparture < 0
+      };
+    }));
+
+    const trajets = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
+    console.log(`[Maps/Agenda] ${trajets.length} trajets calculés`);
+    res.json({ success: true, trajets });
+
+  } catch (error) {
+    console.error('[Maps/Agenda] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
