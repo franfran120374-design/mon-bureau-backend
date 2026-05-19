@@ -152,7 +152,31 @@ app.post('/claude/analyze', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// =================
+// AGENTS IA
+// =================
 
+app.post('/agents/chat', async (req, res) => {
+  try {
+    const { messages, system } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ success: false, error: 'Messages array is required' });
+    }
+    const config = {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      messages: messages
+    };
+    if (system) config.system = system;
+    console.log('[Agents] Request:', { messageCount: messages.length, hasSystem: !!system });
+    const message = await anthropic.messages.create(config);
+    console.log('[Agents] Response OK');
+    res.json({ success: true, content: message.content, usage: message.usage, model: message.model, stop_reason: message.stop_reason });
+  } catch (error) {
+    console.error('[Agents] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // =================
 // PROXY GOOGLE MAPS (Directions API - évite CORS)
 // =================
