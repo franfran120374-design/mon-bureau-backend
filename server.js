@@ -152,31 +152,7 @@ app.post('/claude/analyze', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-// =================
-// AGENTS IA
-// =================
 
-app.post('/agents/chat', async (req, res) => {
-  try {
-    const { messages, system } = req.body;
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ success: false, error: 'Messages array is required' });
-    }
-    const config = {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      messages: messages
-    };
-    if (system) config.system = system;
-    console.log('[Agents] Request:', { messageCount: messages.length, hasSystem: !!system });
-    const message = await anthropic.messages.create(config);
-    console.log('[Agents] Response OK');
-    res.json({ success: true, content: message.content, usage: message.usage, model: message.model, stop_reason: message.stop_reason });
-  } catch (error) {
-    console.error('[Agents] Error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 // =================
 // PROXY GOOGLE MAPS (Directions API - évite CORS)
 // =================
@@ -375,6 +351,156 @@ app.post('/maps/trajets-agenda', async (req, res) => {
 });
 
 // =================
+// CONTACTS (People API)
+
+// =================
+// MÉTÉO - Endpoints backend (à ajouter dans server.js)
+// Utilise Open-Meteo (gratuite, sans clé)
+// =================
+
+const TOULOUSE_LAT = 43.6047;
+const TOULOUSE_LON = 1.4442;
+
+// Météo actuelle
+app.get('/meteo/actuelle', async (req, res) => {
+  try {
+    const params = new URLSearchParams({
+      latitude: TOULOUSE_LAT,
+      longitude: TOULOUSE_LON,
+      current_weather: true,
+      hourly: 'temperature_2m,precipitation,precipitation_probability,apparent_temperature,uv_index,direct_radiation,windspeed_10m,weathercode,snowfall',
+      forecast_days: 1,
+      timezone: 'Europe/Paris'
+    });
+
+    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
+    const data = await response.json();
+
+    console.log('[Météo] Actuelle récupérée');
+    res.json({ success: true, data });
+  } catch(error) {
+    console.error('[Météo] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Météo à une heure précise
+app.get('/meteo/heure', async (req, res) => {
+  try {
+    const { datetime } = req.query;
+    if (!datetime) return res.status(400).json({ success: false, error: 'datetime requis' });
+
+    const targetTime = new Date(datetime);
+    const params = new URLSearchParams({
+      latitude: TOULOUSE_LAT,
+      longitude: TOULOUSE_LON,
+      hourly: 'temperature_2m,precipitation,precipitation_probability,apparent_temperature,uv_index,direct_radiation,windspeed_10m,weathercode,snowfall',
+      forecast_days: 2,
+      timezone: 'Europe/Paris'
+    });
+
+    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
+    const data = await response.json();
+
+    // Trouver l'heure la plus proche
+    const hours = data.hourly.time;
+    let bestIdx = 0, bestDiff = Infinity;
+    hours.forEach((t, i) => {
+      const diff = Math.abs(new Date(t) - targetTime);
+      if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+    });
+
+    const meteo = {
+      time: hours[bestIdx],
+      temperature: data.hourly.temperature_2m[bestIdx],
+      apparentTemp: data.hourly.apparent_temperature[bestIdx],
+      precipitation: data.hourly.precipitation[bestIdx],
+      precipProb: data.hourly.precipitation_probability[bestIdx],
+      windspeed: data.hourly.windspeed_10m[bestIdx],
+      snowfall: data.hourly.snowfall[bestIdx],
+      uvIndex: data.hourly.uv_index[bestIdx],
+      radiation: data.hourly.direct_radiation[bestIdx],
+      weathercode: data.hourly.weathercode[bestIdx]
+    };
+
+    console.log(`[Météo] Heure ${datetime}: ${meteo.temperature}°C, pluie: ${meteo.precipProb}%`);
+    res.json({ success: true, meteo });
+  } catch(error) {
+    console.error('[Météo] Heure error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Conseils vestimentaires pour un RDV
+app.post('/meteo/conseils-rdv', async (req, res) => {
+  try {
+    const { eventTitle, departTime, destination } = req.body;
+    if (!departTime) return res.status(400).json({ success: false, error: 'departTime requis' });
+
+    const params = new URLSearchParams({
+      latitude: TOULOUSE_LAT,
+      longitude: TOULOUSE_LON,
+      hourly: 'temperature_2m,precipitation,precipitation_probability,apparent_temperature,uv_index,direct_radiation,windspeed_10m,weathercode,snowfall',
+      forecast_days: 2,
+      timezone: 'Europe/Paris'
+    });
+
+    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
+    const data = await response.json();
+
+    const targetTime = new Date(departTime);
+    const hours = data.hourly.time;
+    let bestIdx = 0, bestDiff = Infinity;
+    hours.forEach((t, i) => {
+      const diff = Math.abs(new Date(t) - targetTime);
+      if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+    });
+
+    const meteo = {
+      temperature: data.hourly.temperature_2m[bestIdx],
+      apparentTemp: data.hourly.apparent_temperature[bestIdx],
+      precipitation: data.hourly.precipitation[bestIdx],
+      precipProb: data.hourly.precipitation_probability[bestIdx],
+      windspeed: data.hourly.windspeed_10m[bestIdx],
+      snowfall: data.hourly.snowfall[bestIdx],
+      uvIndex: data.hourly.uv_index[bestIdx],
+      radiation: data.hourly.direct_radiation[bestIdx],
+      weathercode: data.hourly.weathercode[bestIdx]
+    };
+
+    // Générer les conseils
+    const conseils = [];
+    if (meteo.precipitation >= 0.3 || meteo.precipProb >= 70) conseils.push({ icon: '☂️', item: 'Parapluie', raison: `${meteo.precipProb}% de risque de pluie` });
+    else if (meteo.precipProb >= 40) conseils.push({ icon: '🌂', item: 'Imperméable léger', raison: `${meteo.precipProb}% risque de bruine` });
+    if (meteo.snowfall >= 0.1) conseils.push({ icon: '🥾', item: 'Bottes imperméables', raison: 'Neige prévue' });
+    if (meteo.uvIndex >= 5) conseils.push({ icon: '🧴', item: 'Crème solaire', raison: `UV ${Math.round(meteo.uvIndex)}` });
+    if (meteo.radiation >= 700 || meteo.uvIndex >= 4) conseils.push({ icon: '🕶️', item: 'Lunettes de soleil', raison: 'Fort ensoleillement' });
+    const temp = meteo.apparentTemp ?? meteo.temperature;
+    if (temp <= 10) conseils.push({ icon: '🧥', item: 'Manteau chaud', raison: `${Math.round(temp)}°C ressentis` });
+    else if (temp <= 16) conseils.push({ icon: '🧣', item: 'Veste', raison: `${Math.round(temp)}°C, temps frais` });
+    if (meteo.windspeed >= 30) conseils.push({ icon: '💨', item: 'Coupe-vent', raison: `Vent ${Math.round(meteo.windspeed)} km/h` });
+
+    const codes = { 0:'☀️ Ciel dégagé', 1:'🌤️ Dégagé', 2:'⛅ Nuageux', 3:'☁️ Couvert', 51:'🌦️ Bruine', 61:'🌧️ Pluie légère', 63:'🌧️ Pluie', 65:'🌧️ Pluie forte', 71:'❄️ Neige', 80:'🌦️ Averses', 95:'⛈️ Orage' };
+    const desc = codes[meteo.weathercode] || '🌡️ Variable';
+
+    console.log(`[Météo] Conseils RDV "${eventTitle}": ${conseils.length} conseils`);
+    res.json({
+      success: true,
+      eventTitle,
+      departTime,
+      meteo: { ...meteo, temperature: Math.round(meteo.temperature), apparentTemp: Math.round(meteo.apparentTemp) },
+      desc,
+      conseils,
+      resume: conseils.length
+        ? `${desc} · ${Math.round(temp)}°C · Pense à : ${conseils.map(c => c.item).join(', ')}`
+        : `${desc} · ${Math.round(temp)}°C · Aucun équipement spécial nécessaire ✅`
+    });
+  } catch(error) {
+    console.error('[Météo] Conseils error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // CONTACTS (People API)
 // =================
 
