@@ -100,13 +100,69 @@ app.post('/agents/chat', async (req, res) => {
   try {
     const { messages, system } = req.body;
     if (!messages || !Array.isArray(messages)) return res.status(400).json({ success: false, error: 'Messages array is required' });
-    const config = { model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages };
-    if (system) config.system = system;
-    console.log('[Agents] Request:', { messageCount: messages.length, hasSystem: !!system });
-    const message = await anthropic.messages.create(config);
-    console.log('[Agents] Response OK');
-    res.json({ success: true, content: message.content, usage: message.usage, model: message.model, stop_reason: message.stop_reason });
-  } catch (error) { console.error('[Agents] Error:', error); res.status(500).json({ success: false, error: error.message }); }
+
+    let fullContent = [];
+    let currentMessages = [...messages];
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    const MAX_TURNS = 5; // Maximum de continuations automatiques
+
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const config = {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8000, // Augmenté pour éviter les coupures
+        messages: currentMessages
+      };
+      if (system) config.system = system;
+
+      console.log(`[Agents] Turn ${turn + 1}, messages: ${currentMessages.length}`);
+      const message = await anthropic.messages.create(config);
+
+      totalInputTokens += message.usage?.input_tokens || 0;
+      totalOutputTokens += message.usage?.output_tokens || 0;
+
+      // Collecter le contenu de ce tour
+      const textBlocks = message.content.filter(b => b.type === 'text');
+      fullContent.push(...textBlocks);
+
+      // Si stop_reason est 'end_turn' → réponse complète, on s'arrête
+      if (message.stop_reason === 'end_turn') {
+        console.log(`[Agents] Complet en ${turn + 1} tour(s)`);
+        break;
+      }
+
+      // Si stop_reason est 'max_tokens' → Claude a été coupé, on continue
+      if (message.stop_reason === 'max_tokens') {
+        console.log(`[Agents] Coupé à ${turn + 1}, continuation...`);
+        // Ajouter la réponse partielle et demander de continuer
+        currentMessages = [
+          ...currentMessages,
+          { role: 'assistant', content: message.content },
+          { role: 'user', content: 'Continue.' }
+        ];
+        continue;
+      }
+
+      // Autre stop_reason → on s'arrête
+      break;
+    }
+
+    // Fusionner tout le texte en une seule réponse
+    const mergedText = fullContent.map(b => b.text).join('');
+
+    console.log(`[Agents] Réponse finale: ${mergedText.length} chars, tokens: ${totalOutputTokens}`);
+    res.json({
+      success: true,
+      content: [{ type: 'text', text: mergedText }],
+      usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
+      model: 'claude-sonnet-4-20250514',
+      stop_reason: 'end_turn'
+    });
+
+  } catch (error) {
+    console.error('[Agents] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // =================
