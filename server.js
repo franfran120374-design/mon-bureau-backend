@@ -627,6 +627,238 @@ app.get('/spotify/currently-playing', async (req, res) => {
 });
 
 // =================
+
+// =================
+// CINÉMA INDÉPENDANT TOULOUSE - Endpoints backend
+// À ajouter dans server.js avant la section HEALTH & START
+// =================
+
+// Cinémas indépendants Toulouse
+const CINEMAS_INDEPENDANTS = {
+  abc: {
+    name: 'Cinéma ABC',
+    address: '13 rue Saint-Bernard, Toulouse',
+    url: 'https://www.abc-toulouse.fr',
+    programmeUrl: 'https://www.abc-toulouse.fr/programme',
+    lat: 43.6048,
+    lon: 1.4431,
+    style: 'Art et essai, films engagés, documentaires'
+  },
+  cosmograph: {
+    name: 'Cosmograph',
+    address: '10 rue Peyrolières, Toulouse',
+    url: 'https://cosmograph.fr',
+    programmeUrl: 'https://cosmograph.fr/programme',
+    lat: 43.6005,
+    lon: 1.4431,
+    style: 'Cinéma du monde, films rares, répertoire'
+  },
+  cratere: {
+    name: 'Le Cratère',
+    address: '95 allées Jules Guesde, Toulouse',
+    url: 'https://www.lecratere.fr',
+    programmeUrl: 'https://www.lecratere.fr/programme',
+    lat: 43.5964,
+    lon: 1.4474,
+    style: 'Art et essai, jeune public, animations'
+  },
+  veo: {
+    name: 'Véo',
+    address: '15 rue de la Pomme, Toulouse',
+    url: 'https://www.veo-cinema.fr',
+    programmeUrl: 'https://www.veo-cinema.fr/programme',
+    lat: 43.5996,
+    lon: 1.4449,
+    style: 'Films indépendants, avant-premières, répertoire'
+  }
+};
+
+// Infos statiques des cinémas (pas de scraping - APIs publiques)
+app.get('/cinema/infos', (req, res) => {
+  res.json({
+    success: true,
+    cinemas: Object.entries(CINEMAS_INDEPENDANTS).map(([id, c]) => ({
+      id,
+      name: c.name,
+      address: c.address,
+      url: c.url,
+      programmeUrl: c.programmeUrl,
+      style: c.style,
+      mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name + ' ' + c.address)}`
+    }))
+  });
+});
+
+// Recherche AlloCiné pour les séances (cinémas indépendants Toulouse)
+app.get('/cinema/seances', async (req, res) => {
+  try {
+    const { date } = req.query;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+
+    // Utiliser l'API AlloCiné (format non-officiel mais fonctionnel)
+    // Codes AlloCiné des cinémas indépendants Toulouse :
+    const allocineCodes = {
+      abc: 'P0048',        // ABC Toulouse
+      cosmograph: 'P2607', // Cosmograph
+      cratere: 'P0217',    // Le Cratère
+      veo: 'P2171'         // Véo
+    };
+
+    const results = await Promise.allSettled(
+      Object.entries(allocineCodes).map(async ([id, code]) => {
+        try {
+          const url = `https://www.allocine.fr/_/showtimes/theater-${code}/d-${targetDate}/`;
+          const response = await fetch(url, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Accept': 'application/json, text/plain, */*',
+              'Accept-Language': 'fr-FR,fr;q=0.9'
+            },
+            signal: AbortSignal.timeout(8000)
+          });
+
+          if (!response.ok) return { id, films: [], error: `HTTP ${response.status}` };
+
+          const data = await response.json();
+          const cinema = CINEMAS_INDEPENDANTS[id];
+
+          const films = (data.results || []).map(item => ({
+            titre: item.movie?.title || '',
+            titreOriginal: item.movie?.originalTitle || '',
+            duree: item.movie?.runtime ? `${Math.floor(item.movie.runtime / 60)}h${item.movie.runtime % 60}` : '',
+            synopsis: item.movie?.synopsis?.substring(0, 200) || '',
+            note: item.movie?.stats?.userRating?.score || null,
+            affiche: item.movie?.poster?.url || null,
+            genres: (item.movie?.genres || []).map(g => g.tag).join(', '),
+            seances: (item.showtimes?.dubbed || item.showtimes?.original || []).map(s => ({
+              heure: s.startsAt ? new Date(s.startsAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '',
+              version: s.tags?.includes('vf') ? 'VF' : 'VO'
+            })).filter(s => s.heure)
+          })).filter(f => f.titre && f.seances.length > 0);
+
+          return {
+            id,
+            cinema: { name: cinema.name, address: cinema.address, style: cinema.style, url: cinema.url },
+            films,
+            date: targetDate
+          };
+
+        } catch(e) {
+          return { id, films: [], error: e.message };
+        }
+      })
+    );
+
+    const seances = results
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value)
+      .filter(r => !r.error || r.films?.length > 0);
+
+    console.log(`[Cinéma] Séances du ${targetDate}: ${seances.reduce((a, c) => a + (c.films?.length || 0), 0)} films`);
+    res.json({ success: true, date: targetDate, cinemas: seances });
+
+  } catch(error) {
+    console.error('[Cinéma] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Films recommandés selon les dispos du calendrier
+app.post('/cinema/recommande', async (req, res) => {
+  try {
+    const { tokens, date, googleTokens } = req.body;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+
+    // 1. Récupérer les séances
+    const seancesResp = await fetch(`http://localhost:${process.env.PORT || 3000}/cinema/seances?date=${targetDate}`);
+    const seancesData = await seancesResp.json();
+
+    let dispos = null;
+
+    // 2. Si tokens Google fournis, récupérer les dispos du calendrier
+    if (googleTokens) {
+      try {
+        const auth = getAuthClient(googleTokens);
+        const calendar = google.calendar({ version: 'v3', auth });
+        const dayStart = new Date(targetDate + 'T00:00:00+02:00');
+        const dayEnd = new Date(targetDate + 'T23:59:59+02:00');
+
+        const eventsResp = await calendar.events.list({
+          calendarId: 'primary',
+          timeMin: dayStart.toISOString(),
+          timeMax: dayEnd.toISOString(),
+          singleEvents: true,
+          orderBy: 'startTime'
+        });
+
+        const events = eventsResp.data.items || [];
+        // Créneaux occupés
+        const occupes = events.map(e => ({
+          debut: new Date(e.start?.dateTime || e.start?.date),
+          fin: new Date(e.end?.dateTime || e.end?.date),
+          titre: e.summary
+        }));
+        dispos = { events: occupes };
+
+      } catch(e) {
+        console.warn('[Cinéma] Pas de tokens calendar:', e.message);
+      }
+    }
+
+    // 3. Filtrer les séances selon les dispos
+    const recommandations = [];
+
+    (seancesData.cinemas || []).forEach(cinema => {
+      (cinema.films || []).forEach(film => {
+        const seancesDispo = film.seances.filter(s => {
+          if (!dispos?.events?.length) return true;
+
+          const [h, m] = s.heure.split(':').map(Number);
+          const seanceDebut = new Date(targetDate);
+          seanceDebut.setHours(h, m, 0);
+          const seanceFin = new Date(seanceDebut.getTime() + 120 * 60000); // +2h approx
+
+          // Vérifier qu'aucun event ne chevauche
+          return !dispos.events.some(ev =>
+            ev.debut < seanceFin && ev.fin > seanceDebut
+          );
+        });
+
+        if (seancesDispo.length > 0) {
+          recommandations.push({
+            cinema: cinema.cinema.name,
+            cinemaUrl: cinema.cinema.url,
+            cinemaStyle: cinema.cinema.style,
+            titre: film.titre,
+            titreOriginal: film.titreOriginal,
+            duree: film.duree,
+            note: film.note,
+            genres: film.genres,
+            synopsis: film.synopsis,
+            seancesDispo,
+            seancesTotal: film.seances
+          });
+        }
+      });
+    });
+
+    // Trier par note décroissante
+    recommandations.sort((a, b) => (b.note || 0) - (a.note || 0));
+
+    console.log(`[Cinéma/Recommande] ${recommandations.length} films disponibles le ${targetDate}`);
+    res.json({
+      success: true,
+      date: targetDate,
+      hasCalendar: !!dispos,
+      recommandations: recommandations.slice(0, 10)
+    });
+
+  } catch(error) {
+    console.error('[Cinéma/Recommande] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // HEALTH & START
 // =================
 
