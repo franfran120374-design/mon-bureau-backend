@@ -859,10 +859,205 @@ app.post('/cinema/recommande', async (req, res) => {
   }
 });
 
+
+// =================
+// DRIVE AGENT - Endpoints backend
+// À ajouter dans server.js avant HEALTH & START
+// =================
+
+// Rechercher un dossier Drive par nom
+app.get('/drive/search-folder', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    const { name, parentId } = req.query;
+
+    let q = `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    if (parentId) q += ` and '${parentId}' in parents`;
+
+    const resp = await drive.files.list({ q, fields: 'files(id,name)', pageSize: 1 });
+    const folder = resp.data.files?.[0] || null;
+    res.json({ success: true, folder });
+  } catch(e) {
+    console.error('[Drive/SearchFolder]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Sauvegarder un fichier agent dans Drive (crée le dossier si besoin)
+app.post('/drive/save-agent', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    const { fileName, content, folderName, mimeType = 'text/markdown' } = req.body;
+
+    // 1. Trouver ou créer le dossier "Mon Bureau"
+    let monBureauFolderId = null;
+    const mbSearch = await drive.files.list({
+      q: `name='Mon Bureau' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: 'files(id,name)', pageSize: 1
+    });
+    if (mbSearch.data.files?.length) {
+      monBureauFolderId = mbSearch.data.files[0].id;
+    } else {
+      const mbCreate = await drive.files.create({
+        resource: { name: 'Mon Bureau', mimeType: 'application/vnd.google-apps.folder' },
+        fields: 'id'
+      });
+      monBureauFolderId = mbCreate.data.id;
+    }
+
+    // 2. Trouver ou créer le sous-dossier (ex: "Mon Bureau — Agents")
+    let targetFolderId = monBureauFolderId;
+    if (folderName) {
+      const subSearch = await drive.files.list({
+        q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${monBureauFolderId}' in parents and trashed=false`,
+        fields: 'files(id,name)', pageSize: 1
+      });
+      if (subSearch.data.files?.length) {
+        targetFolderId = subSearch.data.files[0].id;
+      } else {
+        const subCreate = await drive.files.create({
+          resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [monBureauFolderId] },
+          fields: 'id'
+        });
+        targetFolderId = subCreate.data.id;
+      }
+    }
+
+    // 3. Vérifier si le fichier existe déjà (pour l'écraser)
+    const existSearch = await drive.files.list({
+      q: `name='${fileName}' and '${targetFolderId}' in parents and trashed=false`,
+      fields: 'files(id)', pageSize: 1
+    });
+
+    let fileId, webViewLink;
+
+    if (existSearch.data.files?.length) {
+      // Mettre à jour le fichier existant
+      fileId = existSearch.data.files[0].id;
+      const { Readable } = await import('stream');
+      const stream = Readable.from([content]);
+      await drive.files.update({
+        fileId,
+        media: { mimeType, body: stream },
+        fields: 'id,webViewLink'
+      });
+      const info = await drive.files.get({ fileId, fields: 'webViewLink' });
+      webViewLink = info.data.webViewLink;
+    } else {
+      // Créer le fichier
+      const { Readable } = await import('stream');
+      const stream = Readable.from([content]);
+      const created = await drive.files.create({
+        resource: { name: fileName, parents: [targetFolderId] },
+        media: { mimeType, body: stream },
+        fields: 'id,webViewLink'
+      });
+      fileId = created.data.id;
+      webViewLink = created.data.webViewLink;
+    }
+
+    console.log(`[Drive/SaveAgent] Sauvegardé: ${folderName}/${fileName}`);
+    res.json({ success: true, fileId, webViewLink, fileName });
+
+  } catch(e) {
+    console.error('[Drive/SaveAgent]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Ajouter du contenu à un Google Doc (crée le doc si besoin)
+app.post('/drive/append-to-doc', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    const docs = google.docs({ version: 'v1', auth });
+    const { docTitle, content, folderName } = req.body;
+
+    // 1. Trouver le dossier parent
+    let folderId = null;
+    const mbSearch = await drive.files.list({
+      q: `name='Mon Bureau' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: 'files(id)', pageSize: 1
+    });
+    if (mbSearch.data.files?.length) {
+      const monBureauId = mbSearch.data.files[0].id;
+      const subSearch = await drive.files.list({
+        q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${monBureauId}' in parents and trashed=false`,
+        fields: 'files(id)', pageSize: 1
+      });
+      folderId = subSearch.data.files?.[0]?.id || monBureauId;
+    }
+
+    // 2. Chercher le Google Doc hebdomadaire
+    let docId = null;
+    const docSearch = await drive.files.list({
+      q: `name='${docTitle}' and mimeType='application/vnd.google-apps.document'${folderId ? ` and '${folderId}' in parents` : ''} and trashed=false`,
+      fields: 'files(id,webViewLink)', pageSize: 1
+    });
+
+    if (docSearch.data.files?.length) {
+      docId = docSearch.data.files[0].id;
+    } else {
+      // Créer le Google Doc
+      const resource = {
+        name: docTitle,
+        mimeType: 'application/vnd.google-apps.document'
+      };
+      if (folderId) resource.parents = [folderId];
+      const created = await drive.files.create({ resource, fields: 'id' });
+      docId = created.data.id;
+
+      // Initialiser avec un titre
+      await docs.documents.batchUpdate({
+        documentId: docId,
+        requestBody: {
+          requests: [{
+            insertText: {
+              location: { index: 1 },
+              text: `${docTitle}\n\n`
+            }
+          }]
+        }
+      });
+    }
+
+    // 3. Récupérer la longueur actuelle du doc
+    const docInfo = await docs.documents.get({ documentId: docId });
+    const endIndex = docInfo.data.body.content.slice(-1)[0]?.endIndex - 1 || 1;
+
+    // 4. Ajouter le nouveau contenu
+    const separator = '\n\n════════════════════════════════\n\n';
+    await docs.documents.batchUpdate({
+      documentId: docId,
+      requestBody: {
+        requests: [{
+          insertText: {
+            location: { index: endIndex },
+            text: separator + content
+          }
+        }]
+      }
+    });
+
+    const docInfoUpdated = await drive.files.get({ fileId: docId, fields: 'webViewLink' });
+    console.log(`[Drive/AppendDoc] Ajouté dans: ${docTitle}`);
+    res.json({ success: true, docId, webViewLink: docInfoUpdated.data.webViewLink });
+
+  } catch(e) {
+    console.error('[Drive/AppendDoc]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // HEALTH & START
 // =================
 
-app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo'] }); });
+app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'drive-agent'] }); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', timestamp: Date.now() }); });
 
 app.listen(PORT, () => {
