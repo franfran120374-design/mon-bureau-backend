@@ -381,30 +381,52 @@ app.post('/calendar/events', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
+      const { credentials } = await auth.refreshAccessToken();
+      auth.setCredentials(credentials);
+    }
     const calendar = google.calendar({ version: 'v3', auth });
-    const event = await calendar.events.insert({ calendarId: 'primary', resource: req.body });
+    const event = await calendar.events.insert({ calendarId: 'primary', requestBody: req.body });
     res.json({ event: event.data, tokens: auth.credentials });
-  } catch (error) { console.error('Calendar create error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { console.error('Calendar create error:', error.message); res.status(500).json({ error: error.message }); }
 });
 
 app.delete('/calendar/events/:eventId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
+      const { credentials } = await auth.refreshAccessToken();
+      auth.setCredentials(credentials);
+    }
     const calendar = google.calendar({ version: 'v3', auth });
     await calendar.events.delete({ calendarId: 'primary', eventId: req.params.eventId });
     res.json({ success: true, tokens: auth.credentials });
-  } catch (error) { console.error('Calendar delete error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { console.error('Calendar delete error:', error.message); res.status(500).json({ error: error.message }); }
 });
 
 app.patch('/calendar/events/:eventId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
+
+    // Refresh automatique si token expiré
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
+      const { credentials } = await auth.refreshAccessToken();
+      auth.setCredentials(credentials);
+    }
+
     const calendar = google.calendar({ version: 'v3', auth });
-    const event = await calendar.events.patch({ calendarId: 'primary', eventId: req.params.eventId, resource: req.body });
+    const event = await calendar.events.patch({
+      calendarId: 'primary',
+      eventId: req.params.eventId,
+      requestBody: req.body  // ← requestBody au lieu de resource (API v3)
+    });
     res.json({ event: event.data, tokens: auth.credentials });
-  } catch (error) { console.error('Calendar update error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) {
+    console.error('Calendar update error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // =================
