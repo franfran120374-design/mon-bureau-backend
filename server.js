@@ -1076,10 +1076,148 @@ app.post('/drive/append-to-doc', async (req, res) => {
   }
 });
 
+
+// =================
+// TISSÉO - Endpoints backend
+// API Open Data Toulouse Métropole
+// Clé gratuite : https://data.toulouse-metropole.fr/pages/api/
+// =================
+
+const TISSEO_API_KEY = process.env.TISSEO_API_KEY || '';
+const TISSEO_BASE = 'https://api.tisseo.fr/v2';
+
+// IDs des arrêts Gallieni et Langlade (fixes, trouvés via API)
+const ARRETS_IDS = {
+  gallieni: 'stop_area:SNCF:87611002', // À confirmer avec l'API
+  langlade: 'stop_area:Tisseo:5498'    // À confirmer avec l'API
+};
+
+// Prochains passages pour un arrêt
+app.get('/tisseo/prochains', async (req, res) => {
+  try {
+    const { arret = 'gallieni', nb = 8 } = req.query;
+    const stopId = ARRETS_IDS[arret];
+
+    if (!stopId) {
+      return res.status(400).json({ success: false, error: `Arrêt inconnu: ${arret}` });
+    }
+
+    if (!TISSEO_API_KEY) {
+      // Mode démo si pas de clé
+      return res.json({
+        success: true,
+        arret,
+        demo: true,
+        passages: [
+          { ligne: 'A', direction: 'Basso Cambo', attente: '3 min', heure: '14:32', realtime: true },
+          { ligne: 'B', direction: 'Borderouge', attente: '7 min', heure: '14:36', realtime: true },
+          { ligne: 'A', direction: 'Balma-Gramont', attente: '10 min', heure: '14:39', realtime: true }
+        ]
+      });
+    }
+
+    const params = new URLSearchParams({
+      key: TISSEO_API_KEY,
+      stopAreaId: stopId,
+      number: nb,
+      srsName: 'EPSG:4326'
+    });
+
+    const response = await fetch(`${TISSEO_BASE}/departures.json?${params}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+
+    const data = await response.json();
+    const now = new Date();
+
+    const passages = (data.departures?.departure || []).map(dep => {
+      const dt = new Date(dep.dateTime);
+      const diffMin = Math.round((dt - now) / 60000);
+      return {
+        ligne: dep.line?.shortName || dep.line?.longName || '?',
+        direction: dep.destination?.name || '',
+        heure: dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
+        attente: diffMin <= 0 ? 'À quai' : diffMin === 1 ? '1 min' : `${diffMin} min`,
+        attenteMin: diffMin,
+        realtime: dep.realTime === '1',
+        mode: dep.line?.transportMode?.nameTransportMode || 'Bus'
+      };
+    });
+
+    console.log(`[Tisséo] ${arret}: ${passages.length} passages`);
+    res.json({ success: true, arret, passages, updatedAt: new Date().toISOString() });
+
+  } catch(error) {
+    console.error('[Tisséo] Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Rechercher un arrêt par nom
+app.get('/tisseo/search', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q) return res.status(400).json({ success: false, error: 'Paramètre q requis' });
+
+    if (!TISSEO_API_KEY) {
+      return res.json({ success: true, demo: true, arrets: [] });
+    }
+
+    const params = new URLSearchParams({
+      key: TISSEO_API_KEY,
+      srsName: 'EPSG:4326',
+      term: q
+    });
+
+    const response = await fetch(`${TISSEO_BASE}/stops_area.json?${params}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+
+    const data = await response.json();
+    const arrets = (data.stopsArea?.stopsArea || []).slice(0, 10).map(s => ({
+      id: s.id,
+      name: s.name,
+      city: s.city?.name || 'Toulouse',
+      lignes: (s.lines?.line || []).map(l => l.shortName || l.longName).join(', ')
+    }));
+
+    res.json({ success: true, arrets });
+  } catch(error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Perturbations en cours
+app.get('/tisseo/perturbations', async (req, res) => {
+  try {
+    if (!TISSEO_API_KEY) {
+      return res.json({ success: true, demo: true, perturbations: [] });
+    }
+
+    const params = new URLSearchParams({ key: TISSEO_API_KEY });
+    const response = await fetch(`${TISSEO_BASE}/disruptions.json?${params}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+
+    const data = await response.json();
+    const perturbations = (data.disruptions?.disruption || []).slice(0, 5).map(d => ({
+      titre: d.title || '',
+      lignes: (d.lines?.line || []).map(l => l.shortName).join(', '),
+      debut: d.startDate,
+      fin: d.endDate,
+      message: d.comment || ''
+    }));
+
+    res.json({ success: true, perturbations });
+  } catch(error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // HEALTH & START
 // =================
 
-app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'drive-agent'] }); });
+app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'drive-agent', 'tisseo'] }); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', timestamp: Date.now() }); });
 
 app.listen(PORT, () => {
