@@ -371,10 +371,22 @@ app.get('/calendar/events', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
+      const { credentials } = await auth.refreshAccessToken();
+      auth.setCredentials(credentials);
+    }
     const calendar = google.calendar({ version: 'v3', auth });
-    const response = await calendar.events.list({ calendarId: 'primary', timeMin: req.query.timeMin || new Date().toISOString(), maxResults: parseInt(req.query.maxResults) || 50, singleEvents: true, orderBy: 'startTime' });
+    const params = {
+      calendarId: 'primary',
+      timeMin: req.query.timeMin || new Date().toISOString(),
+      maxResults: parseInt(req.query.maxResults) || 50,
+      singleEvents: true,
+      orderBy: 'startTime'
+    };
+    if (req.query.timeMax) params.timeMax = req.query.timeMax;
+    const response = await calendar.events.list(params);
     res.json({ events: response.data.items, tokens: auth.credentials });
-  } catch (error) { console.error('Calendar list error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { console.error('Calendar list error:', error.message); res.status(500).json({ error: error.message }); }
 });
 
 app.post('/calendar/events', async (req, res) => {
