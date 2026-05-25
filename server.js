@@ -1275,6 +1275,115 @@ app.get('/tisseo/perturbations', async (req, res) => {
   }
 });
 
+
+// =================
+// VÉLÔTOULOUSE - Endpoints backend
+// API GBFS gratuite, sans clé, temps réel
+// =================
+
+// Cache stations 1 minute
+let _veloCache = null;
+let _veloCacheTime = 0;
+
+async function fetchVeloData() {
+  const now = Date.now();
+  if (_veloCache && now - _veloCacheTime < 60000) return _veloCache;
+
+  try {
+    // 1. Récupérer les infos statiques (noms + positions)
+    const infoResp = await fetch('https://api.cyclocity.fr/contracts/toulouse/gbfs/station_information.json', {
+      signal: AbortSignal.timeout(5000)
+    });
+    const infoData = await infoResp.json();
+
+    // 2. Récupérer les dispo temps réel
+    const statusResp = await fetch('https://api.cyclocity.fr/contracts/toulouse/gbfs/station_status.json', {
+      signal: AbortSignal.timeout(5000)
+    });
+    const statusData = await statusResp.json();
+
+    // Fusionner les deux
+    const statusMap = {};
+    (statusData.data?.stations || []).forEach(s => {
+      statusMap[s.station_id] = s;
+    });
+
+    const stations = (infoData.data?.stations || []).map(s => {
+      const status = statusMap[s.station_id] || {};
+      return {
+        id: s.station_id,
+        name: s.name.replace(/VélôToulouse - /i, '').replace(/Vélo Toulouse - /i, '').trim(),
+        lat: s.lat,
+        lon: s.lon,
+        capacity: s.capacity || 0,
+        availableBikes: status.num_bikes_available || 0,
+        availableDocks: status.num_docks_available || 0,
+        isInstalled: status.is_installed === 1,
+        isRenting: status.is_renting === 1,
+        lastUpdated: status.last_reported || 0
+      };
+    }).filter(s => s.isInstalled && s.isRenting);
+
+    _veloCache = stations;
+    _veloCacheTime = now;
+    return stations;
+
+  } catch(e) {
+    console.error('[Vélo] Erreur GBFS:', e.message);
+    return _veloCache || [];
+  }
+}
+
+// Stations les plus proches d'un point
+app.get('/velo/stations', async (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat) || 43.5986;
+    const lon = parseFloat(req.query.lon) || 1.4441;
+    const nb = parseInt(req.query.nb) || 10;
+
+    const stations = await fetchVeloData();
+
+    // Calculer distances et trier
+    function haversine(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2)**2 +
+                Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
+                Math.sin(dLon/2)**2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    const withDist = stations
+      .map(s => ({ ...s, dist: Math.round(haversine(lat, lon, s.lat, s.lon)) }))
+      .filter(s => s.dist < 2000)
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, nb);
+
+    console.log(`[Vélo] ${withDist.length} stations proches de (${lat}, ${lon})`);
+    res.json({
+      success: true,
+      stations: withDist,
+      total: stations.length,
+      updatedAt: new Date(_veloCacheTime).toISOString()
+    });
+
+  } catch(e) {
+    console.error('[Vélo] Error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Toutes les stations (pour la carte)
+app.get('/velo/all', async (req, res) => {
+  try {
+    const stations = await fetchVeloData();
+    res.json({ success: true, stations, total: stations.length });
+  } catch(e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // HEALTH & START
 // =================
 
