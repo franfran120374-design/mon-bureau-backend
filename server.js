@@ -1003,7 +1003,56 @@ app.post('/drive/save-agent', async (req, res) => {
   }
 });
 
-// Ajouter du contenu à un Google Doc (crée le doc si besoin)
+// Créer un Google Doc dans un dossier Drive spécifique (par ID)
+app.post('/drive/create-doc-in-folder', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
+      const { credentials } = await auth.refreshAccessToken();
+      auth.setCredentials(credentials);
+    }
+    const drive = google.drive({ version: 'v3', auth });
+    const docs = google.docs({ version: 'v1', auth });
+    const { title, content, folderId } = req.body;
+
+    if (!folderId) return res.status(400).json({ success: false, error: 'folderId requis' });
+
+    // 1. Créer le Google Doc dans le dossier cible
+    const resource = {
+      name: title,
+      mimeType: 'application/vnd.google-apps.document',
+      parents: [folderId]
+    };
+    const created = await drive.files.create({ resource, fields: 'id,webViewLink' });
+    const docId = created.data.id;
+    const webViewLink = created.data.webViewLink;
+
+    // 2. Insérer le contenu dans le Doc
+    if (content) {
+      await docs.documents.batchUpdate({
+        documentId: docId,
+        requestBody: {
+          requests: [{
+            insertText: {
+              location: { index: 1 },
+              text: content
+            }
+          }]
+        }
+      });
+    }
+
+    console.log(`[Drive/CreateDoc] "${title}" créé dans dossier ${folderId}`);
+    res.json({ success: true, docId, webViewLink, title });
+
+  } catch(e) {
+    console.error('[Drive/CreateDoc]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+
 app.post('/drive/append-to-doc', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
