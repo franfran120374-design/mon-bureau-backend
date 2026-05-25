@@ -1147,11 +1147,130 @@ app.post('/drive/append-to-doc', async (req, res) => {
 const TISSEO_API_KEY = process.env.TISSEO_API_KEY || '';
 const TISSEO_BASE = 'https://api.tisseo.fr/v2';
 
-// IDs des arrêts Gallieni et Langlade (fixes, trouvés via API)
 const ARRETS_IDS = {
-  gallieni: 'stop_area:SNCF:87611002', // À confirmer avec l'API
-  langlade: 'stop_area:Tisseo:5498'    // À confirmer avec l'API
+  gallieni: null, // On cherche dynamiquement
+  langlade: null
 };
+
+// Prochains passages pour un arrêt
+app.get('/tisseo/prochains', async (req, res) => {
+  try {
+    const { arret = 'gallieni', nb = 8 } = req.query;
+
+    if (!TISSEO_API_KEY) {
+      return res.json({
+        success: true, arret, demo: true,
+        passages: [
+          { ligne: '5', direction: 'Borderouge', attente: '3 min', heure: new Date(Date.now()+3*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 3, realtime: true },
+          { ligne: '152', direction: 'Saint-Michel', attente: '7 min', heure: new Date(Date.now()+7*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 7, realtime: true },
+          { ligne: '5', direction: 'Borderouge', attente: '13 min', heure: new Date(Date.now()+13*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 13, realtime: false }
+        ]
+      });
+    }
+
+    // Chercher l'arrêt par nom si pas encore trouvé
+    let stopId = ARRETS_IDS[arret];
+    if (!stopId) {
+      const searchName = arret === 'gallieni' ? 'Gallieni' : 'Langlade';
+      const searchResp = await fetch(
+        `${TISSEO_BASE}/stops_area.json?key=${TISSEO_API_KEY}&displayLines=1&srsName=EPSG:4326&term=${encodeURIComponent(searchName)}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      const searchData = await searchResp.json();
+      const stops = searchData.stopsArea?.stopsArea || [];
+      if (stops.length > 0) {
+        stopId = stops[0].id;
+        ARRETS_IDS[arret] = stopId;
+        console.log(`[Tisséo] Arrêt trouvé: ${searchName} → ${stopId}`);
+      }
+    }
+
+    if (!stopId) {
+      return res.json({ success: false, error: `Arrêt ${arret} non trouvé` });
+    }
+
+    const params = new URLSearchParams({
+      key: TISSEO_API_KEY,
+      stopAreaId: stopId,
+      number: nb,
+      srsName: 'EPSG:4326'
+    });
+
+    const response = await fetch(`${TISSEO_BASE}/departures.json?${params}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    const data = await response.json();
+    const now = new Date();
+
+    const passages = (data.departures?.departure || []).map(dep => {
+      const dt = new Date(dep.dateTime);
+      const diffMin = Math.round((dt - now) / 60000);
+      return {
+        ligne: dep.line?.shortName || dep.line?.longName || '?',
+        direction: dep.destination?.name || '',
+        heure: dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
+        attente: diffMin <= 0 ? 'À quai' : diffMin === 1 ? '1 min' : `${diffMin} min`,
+        attenteMin: diffMin,
+        realtime: dep.realTime === '1',
+        mode: dep.line?.transportMode?.nameTransportMode || 'Bus'
+      };
+    });
+
+    console.log(`[Tisséo] ${arret} (${stopId}): ${passages.length} passages`);
+    res.json({ success: true, arret, stopId, passages, updatedAt: new Date().toISOString() });
+
+  } catch(error) {
+    console.error('[Tisséo] Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Rechercher un arrêt par nom
+app.get('/tisseo/search', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q) return res.status(400).json({ success: false, error: 'Paramètre q requis' });
+
+    if (!TISSEO_API_KEY) return res.json({ success: true, demo: true, arrets: [] });
+
+    const response = await fetch(
+      `${TISSEO_BASE}/stops_area.json?key=${TISSEO_API_KEY}&displayLines=1&srsName=EPSG:4326&term=${encodeURIComponent(q)}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    const data = await response.json();
+    const arrets = (data.stopsArea?.stopsArea || []).slice(0, 10).map(s => ({
+      id: s.id,
+      name: s.name,
+      city: s.city?.name || 'Toulouse',
+      lignes: (s.lines?.line || []).map(l => l.shortName || l.longName).join(', ')
+    }));
+
+    res.json({ success: true, arrets });
+  } catch(error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Perturbations en cours
+app.get('/tisseo/perturbations', async (req, res) => {
+  try {
+    if (!TISSEO_API_KEY) return res.json({ success: true, demo: true, perturbations: [] });
+    const response = await fetch(`${TISSEO_BASE}/disruptions.json?key=${TISSEO_API_KEY}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    const data = await response.json();
+    const perturbations = (data.disruptions?.disruption || []).slice(0, 5).map(d => ({
+      titre: d.title || '',
+      lignes: (d.lines?.line || []).map(l => l.shortName).join(', '),
+      debut: d.startDate,
+      fin: d.endDate,
+      message: d.comment || ''
+    }));
+    res.json({ success: true, perturbations });
+  } catch(error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // Prochains passages pour un arrêt
 app.get('/tisseo/prochains', async (req, res) => {
@@ -1384,10 +1503,329 @@ app.get('/velo/all', async (req, res) => {
   }
 });
 
+
+// =================
+// CINÉMA INDÉPENDANT TOULOUSE - Backend
+// Sources : sites officiels + AlloCiné
+// =================
+
+const CINEMAS = {
+  abc: {
+    name: 'Cinéma ABC',
+    allocineCode: 'P0071',
+    url: 'https://www.abc-toulouse.fr',
+    programmeUrl: 'https://www.abc-toulouse.fr/programme',
+    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0071.html',
+    style: 'Art et essai · Films engagés'
+  },
+  cosmograph: {
+    name: 'American Cosmograph',
+    allocineCode: 'P0235',
+    url: 'https://www.americancosmograph.fr',
+    programmeUrl: 'https://www.americancosmograph.fr/programme',
+    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0235.html',
+    style: 'Cinéma du monde · Répertoire'
+  },
+  cratere: {
+    name: 'Le Cratère',
+    allocineCode: 'P0056',
+    url: 'https://www.cinemalecratere.fr',
+    programmeUrl: 'https://www.cinemalecratere.fr/programmation',
+    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0056.html',
+    style: 'Art et essai · Tarifs réduits'
+  },
+  veo: {
+    name: 'Véo Cartoucherie',
+    allocineCode: 'G0699',
+    url: 'https://cartoucherie.veocinemas.fr',
+    programmeUrl: 'https://cartoucherie.veocinemas.fr/horaires',
+    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=G0699.html',
+    style: 'Indépendant · Avant-premières'
+  }
+};
+
+// Cache 30 minutes
+let _cinemaCache = null;
+let _cinemaCacheTime = 0;
+const CACHE_TTL = 30 * 60 * 1000;
+
+// Scraper toulourama.fr qui agrège toutes les séances
+async function fetchSeancesToulourama(date) {
+  const targetDate = date || new Date().toISOString().split('T')[0];
+
+  try {
+    const response = await fetch(`https://www.toulourama.fr/?date=${targetDate}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'fr-FR,fr;q=0.9'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = await response.text();
+
+    // Parser le HTML pour extraire les séances
+    const films = [];
+    const cinemaNames = Object.values(CINEMAS).map(c => c.name);
+
+    // Regex pour extraire les blocs de films
+    const filmBlocks = html.match(/<div[^>]*class="[^"]*film[^"]*"[^>]*>[\s\S]*?(?=<div[^>]*class="[^"]*film[^"]*"|$)/gi) || [];
+
+    for (const block of filmBlocks) {
+      // Extraire le titre
+      const titleMatch = block.match(/<h\d[^>]*>([^<]+)<\/h\d>/i) ||
+                         block.match(/class="[^"]*title[^"]*"[^>]*>([^<]+)</i);
+      if (!titleMatch) continue;
+      const titre = titleMatch[1].trim();
+
+      // Extraire les cinémas et séances
+      const cinemaMatches = block.matchAll(/(?:ABC|Cosmograph|Cratère|Véo)[^<]*/gi);
+      const seances = [];
+
+      for (const cm of cinemaMatches) {
+        const cinema = cm[0];
+        const heures = block.match(/\d{1,2}[h:]\d{2}/g) || [];
+        heures.forEach(h => {
+          seances.push({
+            cinema: cinema.trim().substring(0, 30),
+            heure: h.replace(':', 'h')
+          });
+        });
+      }
+
+      if (seances.length > 0) {
+        films.push({ titre, seances, date: targetDate });
+      }
+    }
+
+    return films;
+  } catch(e) {
+    console.warn('[Cinéma] Toulourama scraping échoué:', e.message);
+    return null;
+  }
+}
+
+// Fallback : fetch AlloCiné directement
+async function fetchSeancesAllocine(cinemaCode, date) {
+  const targetDate = date || new Date().toISOString().split('T')[0];
+
+  try {
+    const url = `https://www.allocine.fr/_/showtimes/theater-${cinemaCode}/d-${targetDate}/`;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json, */*',
+        'Accept-Language': 'fr-FR,fr;q=0.9',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+
+    if (!response.ok) return [];
+    const data = await response.json();
+
+    return (data.results || []).map(item => ({
+      titre: item.movie?.title || '',
+      titreOriginal: item.movie?.originalTitle || '',
+      duree: item.movie?.runtime ? `${Math.floor(item.movie.runtime/60)}h${String(item.movie.runtime%60).padStart(2,'0')}` : '',
+      synopsis: (item.movie?.synopsis || '').substring(0, 200),
+      note: item.movie?.stats?.userRating?.score?.toFixed(1) || null,
+      affiche: item.movie?.poster?.url || null,
+      genres: (item.movie?.genres || []).map(g => g.tag).join(', '),
+      seances: [
+        ...(item.showtimes?.dubbed || []),
+        ...(item.showtimes?.original || []),
+        ...(item.showtimes?.local || [])
+      ].map(s => ({
+        heure: s.startsAt ? new Date(s.startsAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' }) : '',
+        version: (s.tags || []).includes('vf') ? 'VF' : (s.tags || []).includes('vost') ? 'VOST' : 'VO'
+      })).filter(s => s.heure)
+    })).filter(f => f.titre && f.seances.length > 0);
+
+  } catch(e) {
+    console.warn(`[Cinéma] AlloCiné ${cinemaCode} échoué:`, e.message);
+    return [];
+  }
+}
+
+// Endpoint principal : séances de tous les cinémas indépendants
+app.get('/cinema/seances', async (req, res) => {
+  try {
+    const { date } = req.query;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    const now = Date.now();
+
+    // Vérifier cache
+    if (_cinemaCache && now - _cinemaCacheTime < CACHE_TTL) {
+      return res.json({ success: true, ...(_cinemaCache), cached: true });
+    }
+
+    // Fetch toutes les cinémas en parallèle via AlloCiné
+    const results = await Promise.allSettled(
+      Object.entries(CINEMAS).map(async ([id, cinema]) => {
+        const films = await fetchSeancesAllocine(cinema.allocineCode, targetDate);
+        return {
+          id,
+          cinema: {
+            name: cinema.name,
+            style: cinema.style,
+            url: cinema.url,
+            allocineUrl: cinema.allocineUrl
+          },
+          films,
+          date: targetDate
+        };
+      })
+    );
+
+    const cinemas = results
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value);
+
+    const totalFilms = cinemas.reduce((acc, c) => acc + c.films.length, 0);
+    console.log(`[Cinéma] ${totalFilms} films pour ${targetDate}`);
+
+    const payload = { date: targetDate, cinemas, totalFilms };
+    _cinemaCache = payload;
+    _cinemaCacheTime = now;
+
+    res.json({ success: true, ...payload });
+
+  } catch(error) {
+    console.error('[Cinéma] Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Infos des cinémas (statique)
+app.get('/cinema/infos', (req, res) => {
+  res.json({
+    success: true,
+    cinemas: Object.entries(CINEMAS).map(([id, c]) => ({
+      id, ...c,
+      mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name + ' Toulouse')}`
+    }))
+  });
+});
+
+// Recommandations selon dispos agenda
+app.post('/cinema/recommande', async (req, res) => {
+  try {
+    const { date, googleTokens } = req.body;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+
+    // Récupérer les séances
+    const seancesResp = await fetch(`http://localhost:${process.env.PORT || 3000}/cinema/seances?date=${targetDate}`);
+    const seancesData = await seancesResp.json();
+
+    let eventsOccupes = [];
+
+    // Si tokens Google, récupérer les RDV du jour
+    if (googleTokens) {
+      try {
+        const auth = getAuthClient(googleTokens);
+        const calendar = google.calendar({ version: 'v3', auth });
+        const dayStart = new Date(targetDate + 'T00:00:00');
+        const dayEnd = new Date(targetDate + 'T23:59:59');
+        const eventsResp = await calendar.events.list({
+          calendarId: 'primary',
+          timeMin: dayStart.toISOString(),
+          timeMax: dayEnd.toISOString(),
+          singleEvents: true, orderBy: 'startTime'
+        });
+        eventsOccupes = (eventsResp.data.items || []).map(e => ({
+          debut: new Date(e.start?.dateTime || e.start?.date),
+          fin: new Date(e.end?.dateTime || e.end?.date),
+          titre: e.summary
+        }));
+      } catch(e) { console.warn('[Cinéma] Agenda non dispo:', e.message); }
+    }
+
+    // Filtrer les séances selon les dispos
+    const recommandations = [];
+    for (const cinema of (seancesData.cinemas || [])) {
+      for (const film of cinema.films) {
+        const seancesDispo = film.seances.filter(s => {
+          if (!s.heure) return false;
+          const [h, m] = s.heure.split('h').map(Number);
+          const debut = new Date(targetDate);
+          debut.setHours(h, m || 0, 0);
+          const fin = new Date(debut.getTime() + ((parseInt(film.duree) || 120) * 60000));
+          // Pas de chevauchement avec les RDV
+          return !eventsOccupes.some(ev => ev.debut < fin && ev.fin > debut);
+        });
+
+        if (seancesDispo.length > 0) {
+          recommandations.push({
+            cinema: cinema.cinema.name,
+            cinemaUrl: cinema.cinema.allocineUrl,
+            cinemaStyle: cinema.cinema.style,
+            ...film,
+            seancesDispo
+          });
+        }
+      }
+    }
+
+    // Trier par note
+    recommandations.sort((a, b) => (parseFloat(b.note) || 0) - (parseFloat(a.note) || 0));
+
+    res.json({
+      success: true,
+      date: targetDate,
+      hasCalendar: eventsOccupes.length > 0,
+      recommandations: recommandations.slice(0, 12)
+    });
+
+  } catch(error) {
+    console.error('[Cinéma/Recommande]', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// =================
+// GOOGLE PLACES AUTOCOMPLETE
+// =================
+
+app.get('/places/autocomplete', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q) return res.status(400).json({ success: false, predictions: [] });
+
+    const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
+    const params = new URLSearchParams({
+      input: q,
+      key: MAPS_KEY,
+      language: 'fr',
+      components: 'country:fr',
+      location: '43.6047,1.4442', // Toulouse
+      radius: 30000,
+      types: 'establishment|geocode'
+    });
+
+    const resp = await fetch(
+      `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`,
+      { signal: AbortSignal.timeout(3000) }
+    );
+    const data = await resp.json();
+    
+    res.json({
+      success: true,
+      predictions: (data.predictions || []).slice(0, 5)
+    });
+  } catch(e) {
+    console.warn('[Places] Erreur:', e.message);
+    res.json({ success: true, predictions: [] });
+  }
+});
+
 // HEALTH & START
 // =================
 
-app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'drive-agent', 'tisseo'] }); });
+app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'drive-agent', 'tisseo', 'velo'] }); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', timestamp: Date.now() }); });
 
 app.listen(PORT, () => {
