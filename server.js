@@ -1822,6 +1822,44 @@ app.get('/places/autocomplete', async (req, res) => {
   }
 });
 
+
+// =================
+// YOUTUBE SEARCH (pour le player musique)
+// =================
+
+app.get('/youtube/search', async (req, res) => {
+  try {
+    const { q, limit = 1 } = req.query;
+    if (!q) return res.status(400).json({ success: false, items: [] });
+
+    const YT_KEY = process.env.YOUTUBE_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
+    const params = new URLSearchParams({
+      key: YT_KEY,
+      q: q + ' audio officiel',
+      part: 'snippet',
+      type: 'video',
+      maxResults: limit,
+      videoCategoryId: '10', // Musique
+      relevanceLanguage: 'fr'
+    });
+
+    const resp = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      console.warn('[YouTube] API Error:', data.error.message);
+      return res.json({ success: false, items: [], error: data.error.message });
+    }
+
+    res.json({ success: true, items: data.items || [] });
+  } catch(e) {
+    console.warn('[YouTube] Error:', e.message);
+    res.json({ success: false, items: [] });
+  }
+});
+
 // HEALTH & START
 // =================
 
