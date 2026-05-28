@@ -1860,6 +1860,85 @@ app.get('/youtube/search', async (req, res) => {
   }
 });
 
+
+// =================
+// ELEVENLABS TTS — Méditation
+// =================
+
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+
+// Voix recommandées pour la méditation (douces, féminines)
+const ELEVEN_VOICES = {
+  'aria':      '9BWtsMINqrJLrRacOk9x', // Aria — douce et naturelle
+  'sarah':     'EXAVITQu4vr4xnSDxMaL', // Sarah — apaisante
+  'charlotte': 'XB0fDUnXU5powFXDhCwa', // Charlotte — douce
+  'laura':     'FGY2WhTYpPnrIDTdsKH5', // Laura — calme
+  'default':   '9BWtsMINqrJLrRacOk9x', // Aria par défaut
+};
+
+app.get('/elevenlabs/voices', async (req, res) => {
+  try {
+    const key = ELEVEN_API_KEY;
+    if (!key) return res.json({ success: false, error: 'Clé ElevenLabs non configurée' });
+    
+    const resp = await fetch('https://api.elevenlabs.io/v1/voices', {
+      headers: { 'xi-api-key': key },
+      signal: AbortSignal.timeout(5000)
+    });
+    const data = await resp.json();
+    res.json({ success: true, voices: data.voices || [] });
+  } catch(e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/elevenlabs/tts', async (req, res) => {
+  try {
+    const { text, voiceId, stability = 0.75, similarityBoost = 0.85 } = req.body;
+    const key = ELEVEN_API_KEY;
+    
+    if (!key) return res.status(400).json({ success: false, error: 'Clé ElevenLabs non configurée' });
+    if (!text) return res.status(400).json({ success: false, error: 'Texte requis' });
+
+    const vid = voiceId || ELEVEN_VOICES.default;
+    
+    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': key,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg'
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_multilingual_v2',
+        voice_settings: {
+          stability,
+          similarity_boost: similarityBoost,
+          style: 0.2,
+          use_speaker_boost: false
+        }
+      }),
+      signal: AbortSignal.timeout(30000)
+    });
+
+    if (!resp.ok) {
+      const err = await resp.text();
+      return res.status(resp.status).json({ success: false, error: err });
+    }
+
+    // Streamer l'audio directement
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-cache');
+    const buffer = await resp.arrayBuffer();
+    res.send(Buffer.from(buffer));
+
+  } catch(e) {
+    console.error('[ElevenLabs]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // HEALTH & START
 // =================
 
