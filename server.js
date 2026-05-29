@@ -1948,19 +1948,27 @@ const GOOGLE_TTS_KEY = process.env.GOOGLE_TTS_KEY || '';
 
 app.post('/tts/synthesize', async (req, res) => {
   try {
-    const { text, voiceName = 'fr-FR-Wavenet-C', speakingRate = 0.85, pitch = -2 } = req.body;
+    const { text, ssml, voiceName = 'fr-FR-Studio-A', speakingRate = 0.38, pitch = -5.0 } = req.body;
     const key = GOOGLE_TTS_KEY;
 
     if (!key) return res.status(400).json({ success: false, error: 'Clé Google TTS non configurée' });
-    if (!text) return res.status(400).json({ success: false, error: 'Texte requis' });
+    if (!text && !ssml) return res.status(400).json({ success: false, error: 'Texte requis' });
+
+    // Support SSML pour les pauses et le style
+    const input = ssml ? { ssml } : { text };
 
     const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${key}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        input: { text },
+        input,
         voice: { languageCode: 'fr-FR', name: voiceName, ssmlGender: 'FEMALE' },
-        audioConfig: { audioEncoding: 'MP3', speakingRate, pitch, effectsProfileId: ['headphone-class-device'] }
+        audioConfig: {
+          audioEncoding: 'MP3',
+          speakingRate,
+          pitch,
+          effectsProfileId: ['headphone-class-device']
+        }
       }),
       signal: AbortSignal.timeout(15000)
     });
@@ -1969,7 +1977,6 @@ app.post('/tts/synthesize', async (req, res) => {
     if (data.error) return res.status(400).json({ success: false, error: data.error.message });
     if (!data.audioContent) return res.status(400).json({ success: false, error: 'Pas de contenu audio' });
 
-    // Retourner le base64 directement
     res.json({ success: true, audioContent: data.audioContent });
 
   } catch(e) {
