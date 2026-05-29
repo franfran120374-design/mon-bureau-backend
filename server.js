@@ -1939,6 +1939,45 @@ app.post('/elevenlabs/tts', async (req, res) => {
   }
 });
 
+
+// =================
+// GOOGLE CLOUD TTS — Méditation
+// =================
+
+const GOOGLE_TTS_KEY = process.env.GOOGLE_TTS_KEY || '';
+
+app.post('/tts/synthesize', async (req, res) => {
+  try {
+    const { text, voiceName = 'fr-FR-Wavenet-C', speakingRate = 0.85, pitch = -2 } = req.body;
+    const key = GOOGLE_TTS_KEY;
+
+    if (!key) return res.status(400).json({ success: false, error: 'Clé Google TTS non configurée' });
+    if (!text) return res.status(400).json({ success: false, error: 'Texte requis' });
+
+    const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${key}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input: { text },
+        voice: { languageCode: 'fr-FR', name: voiceName, ssmlGender: 'FEMALE' },
+        audioConfig: { audioEncoding: 'MP3', speakingRate, pitch, effectsProfileId: ['headphone-class-device'] }
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    const data = await resp.json();
+    if (data.error) return res.status(400).json({ success: false, error: data.error.message });
+    if (!data.audioContent) return res.status(400).json({ success: false, error: 'Pas de contenu audio' });
+
+    // Retourner le base64 directement
+    res.json({ success: true, audioContent: data.audioContent });
+
+  } catch(e) {
+    console.error('[Google TTS]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // HEALTH & START
 // =================
 
