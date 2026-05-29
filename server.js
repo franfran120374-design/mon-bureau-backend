@@ -1954,8 +1954,9 @@ app.post('/tts/synthesize', async (req, res) => {
     if (!key) return res.status(400).json({ success: false, error: 'Clé Google TTS non configurée' });
     if (!text && !ssml) return res.status(400).json({ success: false, error: 'Texte requis' });
 
-    // Support SSML pour les pauses et le style
-    const input = ssml ? { ssml } : { text };
+    // Nettoyer le texte — remplacer les points multiples par des pauses
+    const cleanedText = (text || '').replace(/\.{3,}/g, '... ').replace(/\s{2,}/g, ' ').trim();
+    const input = ssml ? { ssml } : { text: cleanedText };
 
     const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${key}`, {
       method: 'POST',
