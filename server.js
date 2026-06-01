@@ -10,10 +10,7 @@ import Anthropic from '@anthropic-ai/sdk';
 
 dotenv.config();
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
-
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -37,7 +34,86 @@ const SCOPES = [
 ];
 
 // =================
-// ROUTES API CLAUDE
+// HELPERS
+// =================
+
+function getAuthClient(tokens) {
+  if (!tokens) throw new Error('Tokens manquants');
+  const client = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, REDIRECT_URI);
+  client.setCredentials(tokens);
+  return client;
+}
+
+function getTokensFromRequest(req) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) throw new Error('Header Authorization manquant');
+  try { return JSON.parse(Buffer.from(auth.substring(7), 'base64').toString('utf8')); }
+  catch (e) { throw new Error('Tokens invalides'); }
+}
+
+// =================
+// GEMINI (gratuit - remplace Claude pour tâches légères)
+// =================
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL   = 'gemini-1.5-flash';
+const GEMINI_URL     = () => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+async function callGemini(systemPrompt, messages, maxTokens = 1024) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY manquante');
+  const geminiMessages = messages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: typeof m.content === 'string' ? m.content
+        : (Array.isArray(m.content) ? m.content.filter(b => b.type === 'text').map(b => b.text).join('\n') : String(m.content)) }]
+    }));
+  const body = {
+    contents: geminiMessages,
+    generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 }
+  };
+  if (systemPrompt) body.system_instruction = { parts: [{ text: systemPrompt }] };
+  const resp = await fetch(GEMINI_URL(), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(`Gemini ${resp.status}: ${err.error?.message || resp.statusText}`); }
+  const data = await resp.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+// POST /gemini/summarize — résumés RSS (gratuit)
+app.post('/gemini/summarize', async (req, res) => {
+  const { text, type = 'article' } = req.body;
+  if (!text) return res.status(400).json({ success: false, error: 'text requis' });
+  try {
+    const system = 'Tu es un assistant de lecture expert en français. Résume de façon claire, structurée et utile. Réponds TOUJOURS en français.';
+    const prompt = `Résume cet ${type} en 3-4 phrases claires. Points essentiels en premier :\n\n${text.substring(0, 4000)}`;
+    const summary = await callGemini(system, [{ role: 'user', content: prompt }], 512);
+    res.json({ success: true, summary, model: GEMINI_MODEL });
+  } catch(e) { console.error('[Gemini/summarize]', e.message); res.status(500).json({ success: false, error: e.message }); }
+});
+
+// POST /gemini/chat — agents IA, citations (gratuit)
+app.post('/gemini/chat', async (req, res) => {
+  const { messages = [], system = '' } = req.body;
+  if (!messages.length) return res.status(400).json({ success: false, error: 'messages requis' });
+  try {
+    const text = await callGemini(system, messages, 1500);
+    res.json({ success: true, content: [{ type: 'text', text }], model: GEMINI_MODEL });
+  } catch(e) { console.error('[Gemini/chat]', e.message); res.status(500).json({ success: false, error: e.message }); }
+});
+
+// GET /gemini/status
+app.get('/gemini/status', async (req, res) => {
+  if (!GEMINI_API_KEY) return res.json({ ok: false, error: 'GEMINI_API_KEY non configurée' });
+  try {
+    const text = await callGemini('', [{ role: 'user', content: 'Dis juste "ok"' }], 10);
+    res.json({ ok: true, model: GEMINI_MODEL, response: text.trim() });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+// =================
+// CLAUDE — uniquement fiches de lecture et dossiers (qualité max)
 // =================
 
 app.post('/claude/summarize', async (req, res) => {
@@ -93,93 +169,61 @@ app.post('/claude/analyze', async (req, res) => {
 });
 
 // =================
-// AGENTS IA
+// AGENTS IA (Claude — fiches + dossiers)
 // =================
 
 app.post('/agents/chat', async (req, res) => {
   try {
     const { messages, system } = req.body;
     if (!messages || !Array.isArray(messages)) return res.status(400).json({ success: false, error: 'Messages array is required' });
-
-    let fullContent = [];
-    let currentMessages = [...messages];
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    const MAX_TURNS = 5; // Maximum de continuations automatiques
-
+    let fullContent = [], currentMessages = [...messages];
+    let totalInputTokens = 0, totalOutputTokens = 0;
+    const MAX_TURNS = 5;
     for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const config = {
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 8000, // Augmenté pour éviter les coupures
-        messages: currentMessages
-      };
+      const config = { model: 'claude-sonnet-4-20250514', max_tokens: 8000, messages: currentMessages };
       if (system) config.system = system;
-
       console.log(`[Agents] Turn ${turn + 1}, messages: ${currentMessages.length}`);
       const message = await anthropic.messages.create(config);
-
       totalInputTokens += message.usage?.input_tokens || 0;
       totalOutputTokens += message.usage?.output_tokens || 0;
-
-      // Collecter le contenu de ce tour
-      const textBlocks = message.content.filter(b => b.type === 'text');
-      fullContent.push(...textBlocks);
-
-      // Si stop_reason est 'end_turn' → réponse complète, on s'arrête
-      if (message.stop_reason === 'end_turn') {
-        console.log(`[Agents] Complet en ${turn + 1} tour(s)`);
-        break;
-      }
-
-      // Si stop_reason est 'max_tokens' → Claude a été coupé, on continue
+      fullContent.push(...message.content.filter(b => b.type === 'text'));
+      if (message.stop_reason === 'end_turn') { console.log(`[Agents] Complet en ${turn + 1} tour(s)`); break; }
       if (message.stop_reason === 'max_tokens') {
         console.log(`[Agents] Coupé à ${turn + 1}, continuation...`);
-        // Ajouter la réponse partielle et demander de continuer
-        currentMessages = [
-          ...currentMessages,
-          { role: 'assistant', content: message.content },
-          { role: 'user', content: 'Continue.' }
-        ];
+        currentMessages = [...currentMessages, { role: 'assistant', content: message.content }, { role: 'user', content: 'Continue.' }];
         continue;
       }
-
-      // Autre stop_reason → on s'arrête
       break;
     }
-
-    // Fusionner tout le texte en une seule réponse
     const mergedText = fullContent.map(b => b.text).join('');
-
     console.log(`[Agents] Réponse finale: ${mergedText.length} chars, tokens: ${totalOutputTokens}`);
-    res.json({
-      success: true,
-      content: [{ type: 'text', text: mergedText }],
-      usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
-      model: 'claude-sonnet-4-20250514',
-      stop_reason: 'end_turn'
-    });
-
-  } catch (error) {
-    console.error('[Agents] Error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+    res.json({ success: true, content: [{ type: 'text', text: mergedText }], usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }, model: 'claude-sonnet-4-20250514', stop_reason: 'end_turn' });
+  } catch (error) { console.error('[Agents] Error:', error); res.status(500).json({ success: false, error: error.message }); }
 });
 
-// =================
-// PROXY GOOGLE MAPS
-// =================
-
-app.post('/proxy/maps', async (req, res) => {
+// Last.fm proxy
+app.get('/agents/lastfm/:method', async (req, res) => {
   try {
-    const { origin, destination, arrivalTime, mode } = req.body;
-    const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
-    const params = new URLSearchParams({ origin: origin || '10 rue Etienne Bacquié, Toulouse', destination, mode: mode || 'transit', key: MAPS_KEY, language: 'fr', region: 'fr' });
-    if (arrivalTime) params.set('arrival_time', Math.floor(new Date(arrivalTime).getTime() / 1000));
-    const response = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`);
-    const data = await response.json();
-    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') console.error('[Maps] Status:', data.status, data.error_message);
-    res.json(data);
-  } catch (error) { console.error('Maps proxy error:', error); res.status(500).json({ error: error.message, status: 'ERROR' }); }
+    const { method } = req.params;
+    const LFM_KEY = process.env.LASTFM_API_KEY || '58c198bcc66ba74924848228a2fa6935';
+    const LFM_USER = process.env.LASTFM_USER || 'franfran120374';
+    const methodMap = { gettoptracks: 'user.getTopTracks', gettopartists: 'user.getTopArtists', getrecenttracks: 'user.getRecentTracks' };
+    const lfmMethod = methodMap[method.toLowerCase()];
+    if (!lfmMethod) return res.status(404).json({ success: false, error: 'Méthode inconnue' });
+    const params = new URLSearchParams({ method: lfmMethod, user: LFM_USER, api_key: LFM_KEY, format: 'json', limit: req.query.limit || 10, period: req.query.period || '1month' });
+    const data = await fetch(`https://ws.audioscrobbler.com/2.0/?${params}`).then(r => r.json());
+    res.json({ success: true, data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// YouTube search proxy
+app.get('/agents/youtube/search', async (req, res) => {
+  try {
+    const YT_KEY = process.env.YOUTUBE_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
+    const params = new URLSearchParams({ key: YT_KEY, q: req.query.q || '', part: 'snippet', type: 'video', maxResults: req.query.maxResults || 5 });
+    const data = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`).then(r => r.json());
+    res.json({ success: true, items: data.items || [] });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // =================
@@ -189,16 +233,29 @@ app.post('/proxy/maps', async (req, res) => {
 const HOME_ADDRESS = '10 rue Etienne Bacquié, Toulouse';
 const DEFAULT_PREP_MINUTES = 10;
 
+app.post('/proxy/maps', async (req, res) => {
+  try {
+    const { origin, destination, arrivalTime, mode } = req.body;
+    const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
+    const params = new URLSearchParams({ origin: origin || HOME_ADDRESS, destination, mode: mode || 'transit', key: MAPS_KEY, language: 'fr', region: 'fr' });
+    if (arrivalTime) params.set('arrival_time', Math.floor(new Date(arrivalTime).getTime() / 1000));
+    const data = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`).then(r => r.json());
+    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') console.error('[Maps] Status:', data.status, data.error_message);
+    res.json(data);
+  } catch (error) { console.error('Maps proxy error:', error); res.status(500).json({ error: error.message, status: 'ERROR' }); }
+});
+
 app.post('/maps/trajet', async (req, res) => {
   try {
-    const { destination, arrivalTime, mode = 'transit', prepMinutes = DEFAULT_PREP_MINUTES } = req.body;
+    const { destination, arrivalTime, mode = 'transit', prepMinutes = DEFAULT_PREP_MINUTES, origin } = req.body;
     const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
     if (!destination) return res.status(400).json({ success: false, error: 'Destination requise' });
+    const fromAddress = origin || HOME_ADDRESS;
     const arrivalTimestamp = arrivalTime ? Math.floor(new Date(arrivalTime).getTime() / 1000) : Math.floor(Date.now() / 1000 + 3600);
-    const params = new URLSearchParams({ origin: HOME_ADDRESS, destination, mode, arrival_time: arrivalTimestamp, key: MAPS_KEY, language: 'fr', region: 'fr' });
+    const params = new URLSearchParams({ origin: fromAddress, destination, mode, arrival_time: arrivalTimestamp, key: MAPS_KEY, language: 'fr', region: 'fr' });
     let data = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`).then(r => r.json());
     if (data.status !== 'OK') {
-      const params2 = new URLSearchParams({ origin: HOME_ADDRESS, destination, mode, departure_time: 'now', key: MAPS_KEY, language: 'fr', region: 'fr' });
+      const params2 = new URLSearchParams({ origin: fromAddress, destination, mode, departure_time: 'now', key: MAPS_KEY, language: 'fr', region: 'fr' });
       data = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params2}`).then(r => r.json());
     }
     const leg = data.routes?.[0]?.legs?.[0];
@@ -213,9 +270,25 @@ app.post('/maps/trajet', async (req, res) => {
       const departureText = departureTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
       rappel = { departureTime: departureTime.toISOString(), departureText, minutesUntilDeparture, prepMinutes, message: minutesUntilDeparture > 0 ? `Pars dans ${minutesUntilDeparture} min (à ${departureText})` : minutesUntilDeparture === 0 ? 'Pars maintenant !' : `Tu aurais dû partir il y a ${Math.abs(minutesUntilDeparture)} min`, isUrgent: minutesUntilDeparture >= 0 && minutesUntilDeparture <= 15, isLate: minutesUntilDeparture < 0 };
     }
-    const steps = (leg.steps || []).slice(0, 5).map(s => ({ instruction: (s.html_instructions || '').replace(/<[^>]+>/g, ''), duration: s.duration?.text || '', distance: s.distance?.text || '', mode: s.travel_mode?.toLowerCase() || mode, transit: s.transit_details ? { line: s.transit_details.line?.short_name || s.transit_details.line?.name || '', from: s.transit_details.departure_stop?.name || '', to: s.transit_details.arrival_stop?.name || '' } : null }));
+    const steps = (leg.steps || []).map(s => ({
+      instruction: (s.html_instructions || '').replace(/<[^>]+>/g, ''),
+      duration: s.duration?.text || '',
+      distance: s.distance?.text || '',
+      mode: s.travel_mode?.toLowerCase() || mode,
+      transit: s.transit_details ? {
+        line: s.transit_details.line?.short_name || s.transit_details.line?.name || '',
+        headsign: s.transit_details.headsign || '',
+        direction: s.transit_details.headsign || '',
+        from: s.transit_details.departure_stop?.name || '',
+        to: s.transit_details.arrival_stop?.name || '',
+        numStops: s.transit_details.num_stops || 0,
+        departureTime: s.transit_details.departure_time?.text || '',
+        arrivalTime: s.transit_details.arrival_time?.text || '',
+        vehicleType: s.transit_details.line?.vehicle?.type || ''
+      } : null
+    }));
     console.log(`[Maps/Trajet] ${destination}: ${durationText}, départ: ${rappel?.departureText || 'N/A'}`);
-    res.json({ success: true, trajet: { origin: HOME_ADDRESS, destination: leg.end_address || destination, duration: durationText, durationMinutes, distance: leg.distance?.text || '', mode, steps, mapsLink: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(HOME_ADDRESS)}&destination=${encodeURIComponent(destination)}&travelmode=${mode}` }, rappel });
+    res.json({ success: true, trajet: { origin: fromAddress, destination: leg.end_address || destination, duration: durationText, durationMinutes, distance: leg.distance?.text || '', mode, steps, mapsLink: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(fromAddress)}&destination=${encodeURIComponent(destination)}&travelmode=${mode}` }, rappel });
   } catch (error) { console.error('[Maps/Trajet] Error:', error); res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -239,7 +312,13 @@ app.post('/maps/trajets-agenda', async (req, res) => {
         minutesUntilDeparture = Math.round((departureMs - Date.now()) / 60000);
         departureText = departureTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
       }
-      return { eventId: event.id, eventTitle: event.summary || event.title || '', destination: event.location, duration: leg.duration?.text, durationMinutes, distance: leg.distance?.text, mapsLink: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(HOME_ADDRESS)}&destination=${encodeURIComponent(event.location)}&travelmode=transit`, departureTime: departureTime?.toISOString(), departureText, minutesUntilDeparture, isUrgent: minutesUntilDeparture !== null && minutesUntilDeparture >= 0 && minutesUntilDeparture <= 15, isLate: minutesUntilDeparture !== null && minutesUntilDeparture < 0 };
+      const steps = (leg.steps || []).map(s => ({
+        instruction: (s.html_instructions || '').replace(/<[^>]+>/g, ''),
+        duration: s.duration?.text || '', distance: s.distance?.text || '',
+        mode: s.travel_mode?.toLowerCase() || 'transit',
+        transit: s.transit_details ? { line: s.transit_details.line?.short_name || s.transit_details.line?.name || '', headsign: s.transit_details.headsign || '', from: s.transit_details.departure_stop?.name || '', to: s.transit_details.arrival_stop?.name || '', numStops: s.transit_details.num_stops || 0, departureTime: s.transit_details.departure_time?.text || '', arrivalTime: s.transit_details.arrival_time?.text || '', vehicleType: s.transit_details.line?.vehicle?.type || '' } : null
+      }));
+      return { eventId: event.id, eventTitle: event.summary || event.title || '', destination: event.location, duration: leg.duration?.text, durationMinutes, distance: leg.distance?.text, steps, mapsLink: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(HOME_ADDRESS)}&destination=${encodeURIComponent(event.location)}&travelmode=transit`, departureTime: departureTime?.toISOString(), departureText, minutesUntilDeparture, isUrgent: minutesUntilDeparture !== null && minutesUntilDeparture >= 0 && minutesUntilDeparture <= 15, isLate: minutesUntilDeparture !== null && minutesUntilDeparture < 0 };
     }));
     const trajets = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
     console.log(`[Maps/Agenda] ${trajets.length} trajets calculés`);
@@ -257,11 +336,9 @@ const TOULOUSE_LON = 1.4442;
 app.get('/meteo/actuelle', async (req, res) => {
   try {
     const params = new URLSearchParams({ latitude: TOULOUSE_LAT, longitude: TOULOUSE_LON, current_weather: true, hourly: 'temperature_2m,precipitation,precipitation_probability,apparent_temperature,uv_index,direct_radiation,windspeed_10m,weathercode,snowfall', forecast_days: 1, timezone: 'Europe/Paris' });
-    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
-    const data = await response.json();
-    console.log('[Météo] Actuelle récupérée');
+    const data = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`).then(r => r.json());
     res.json({ success: true, data });
-  } catch(error) { console.error('[Météo] Error:', error); res.status(500).json({ success: false, error: error.message }); }
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.get('/meteo/heure', async (req, res) => {
@@ -275,9 +352,8 @@ app.get('/meteo/heure', async (req, res) => {
     let bestIdx = 0, bestDiff = Infinity;
     hours.forEach((t, i) => { const diff = Math.abs(new Date(t) - targetTime); if (diff < bestDiff) { bestDiff = diff; bestIdx = i; } });
     const meteo = { time: hours[bestIdx], temperature: data.hourly.temperature_2m[bestIdx], apparentTemp: data.hourly.apparent_temperature[bestIdx], precipitation: data.hourly.precipitation[bestIdx], precipProb: data.hourly.precipitation_probability[bestIdx], windspeed: data.hourly.windspeed_10m[bestIdx], snowfall: data.hourly.snowfall[bestIdx], uvIndex: data.hourly.uv_index[bestIdx], radiation: data.hourly.direct_radiation[bestIdx], weathercode: data.hourly.weathercode[bestIdx] };
-    console.log(`[Météo] Heure ${datetime}: ${meteo.temperature}°C, pluie: ${meteo.precipProb}%`);
     res.json({ success: true, meteo });
-  } catch(error) { console.error('[Météo] Heure error:', error); res.status(500).json({ success: false, error: error.message }); }
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.post('/meteo/conseils-rdv', async (req, res) => {
@@ -303,28 +379,12 @@ app.post('/meteo/conseils-rdv', async (req, res) => {
     if (meteo.windspeed >= 30) conseils.push({ icon: '💨', item: 'Coupe-vent', raison: `Vent ${Math.round(meteo.windspeed)} km/h` });
     const codes = { 0:'☀️ Ciel dégagé', 1:'🌤️ Dégagé', 2:'⛅ Nuageux', 3:'☁️ Couvert', 51:'🌦️ Bruine', 61:'🌧️ Pluie légère', 63:'🌧️ Pluie', 65:'🌧️ Pluie forte', 71:'❄️ Neige', 80:'🌦️ Averses', 95:'⛈️ Orage' };
     const desc = codes[meteo.weathercode] || '🌡️ Variable';
-    console.log(`[Météo] Conseils RDV "${eventTitle}": ${conseils.length} conseils`);
     res.json({ success: true, eventTitle, departTime, meteo: { ...meteo, temperature: Math.round(meteo.temperature), apparentTemp: Math.round(meteo.apparentTemp) }, desc, conseils, resume: conseils.length ? `${desc} · ${Math.round(temp)}°C · Pense à : ${conseils.map(c => c.item).join(', ')}` : `${desc} · ${Math.round(temp)}°C · Aucun équipement spécial nécessaire ✅` });
-  } catch(error) { console.error('[Météo] Conseils error:', error); res.status(500).json({ success: false, error: error.message }); }
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 // =================
-// CONTACTS (People API)
-// =================
-
-app.get('/contacts/search', async (req, res) => {
-  try {
-    const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const people = google.people({ version: 'v1', auth });
-    const response = await people.people.searchContacts({ query: req.query.q || '', readMask: 'names,emailAddresses', pageSize: 10 });
-    const contacts = (response.data.results || []).map(r => ({ name: r.person?.names?.[0]?.displayName || '', email: r.person?.emailAddresses?.[0]?.value || '' })).filter(c => c.email);
-    res.json({ contacts, tokens: auth.credentials });
-  } catch (error) { console.error('Contacts search error:', error); res.status(500).json({ contacts: [], error: error.message }); }
-});
-
-// =================
-// ROUTES OAuth Google
+// AUTH GOOGLE
 // =================
 
 app.get('/auth/google/url', (req, res) => {
@@ -346,22 +406,19 @@ app.get('/auth/google/callback', async (req, res) => {
 });
 
 // =================
-// Helper functions
+// CONTACTS
 // =================
 
-function getAuthClient(tokens) {
-  if (!tokens) throw new Error('Tokens manquants');
-  const client = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, REDIRECT_URI);
-  client.setCredentials(tokens);
-  return client;
-}
-
-function getTokensFromRequest(req) {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) throw new Error('Header Authorization manquant');
-  try { return JSON.parse(Buffer.from(auth.substring(7), 'base64').toString('utf8')); }
-  catch (e) { throw new Error('Tokens invalides'); }
-}
+app.get('/contacts/search', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const people = google.people({ version: 'v1', auth });
+    const response = await people.people.searchContacts({ query: req.query.q || '', readMask: 'names,emailAddresses', pageSize: 10 });
+    const contacts = (response.data.results || []).map(r => ({ name: r.person?.names?.[0]?.displayName || '', email: r.person?.emailAddresses?.[0]?.value || '' })).filter(c => c.email);
+    res.json({ contacts, tokens: auth.credentials });
+  } catch (error) { console.error('Contacts search error:', error); res.status(500).json({ contacts: [], error: error.message }); }
+});
 
 // =================
 // CALENDAR
@@ -371,18 +428,9 @@ app.get('/calendar/events', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
-    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
-      const { credentials } = await auth.refreshAccessToken();
-      auth.setCredentials(credentials);
-    }
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) { const { credentials } = await auth.refreshAccessToken(); auth.setCredentials(credentials); }
     const calendar = google.calendar({ version: 'v3', auth });
-    const params = {
-      calendarId: 'primary',
-      timeMin: req.query.timeMin || new Date().toISOString(),
-      maxResults: parseInt(req.query.maxResults) || 50,
-      singleEvents: true,
-      orderBy: 'startTime'
-    };
+    const params = { calendarId: 'primary', timeMin: req.query.timeMin || new Date().toISOString(), maxResults: parseInt(req.query.maxResults) || 50, singleEvents: true, orderBy: 'startTime' };
     if (req.query.timeMax) params.timeMax = req.query.timeMax;
     const response = await calendar.events.list(params);
     res.json({ events: response.data.items, tokens: auth.credentials });
@@ -393,10 +441,7 @@ app.post('/calendar/events', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
-    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
-      const { credentials } = await auth.refreshAccessToken();
-      auth.setCredentials(credentials);
-    }
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) { const { credentials } = await auth.refreshAccessToken(); auth.setCredentials(credentials); }
     const calendar = google.calendar({ version: 'v3', auth });
     const event = await calendar.events.insert({ calendarId: 'primary', requestBody: req.body });
     res.json({ event: event.data, tokens: auth.credentials });
@@ -407,10 +452,7 @@ app.delete('/calendar/events/:eventId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
-    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
-      const { credentials } = await auth.refreshAccessToken();
-      auth.setCredentials(credentials);
-    }
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) { const { credentials } = await auth.refreshAccessToken(); auth.setCredentials(credentials); }
     const calendar = google.calendar({ version: 'v3', auth });
     await calendar.events.delete({ calendarId: 'primary', eventId: req.params.eventId });
     res.json({ success: true, tokens: auth.credentials });
@@ -421,24 +463,11 @@ app.patch('/calendar/events/:eventId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
-
-    // Refresh automatique si token expiré
-    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
-      const { credentials } = await auth.refreshAccessToken();
-      auth.setCredentials(credentials);
-    }
-
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) { const { credentials } = await auth.refreshAccessToken(); auth.setCredentials(credentials); }
     const calendar = google.calendar({ version: 'v3', auth });
-    const event = await calendar.events.patch({
-      calendarId: 'primary',
-      eventId: req.params.eventId,
-      requestBody: req.body  // ← requestBody au lieu de resource (API v3)
-    });
+    const event = await calendar.events.patch({ calendarId: 'primary', eventId: req.params.eventId, requestBody: req.body });
     res.json({ event: event.data, tokens: auth.credentials });
-  } catch (error) {
-    console.error('Calendar update error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { console.error('Calendar update error:', error.message); res.status(500).json({ error: error.message }); }
 });
 
 // =================
@@ -452,7 +481,7 @@ app.get('/drive/files', async (req, res) => {
     const drive = google.drive({ version: 'v3', auth });
     const response = await drive.files.list({ pageSize: parseInt(req.query.pageSize) || 20, fields: 'files(id, name, mimeType, modifiedTime, size, webViewLink)', q: req.query.query || "trashed=false", orderBy: 'modifiedTime desc' });
     res.json({ files: response.data.files, tokens: auth.credentials });
-  } catch (error) { console.error('Drive list error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/drive/search', async (req, res) => {
@@ -462,7 +491,7 @@ app.get('/drive/search', async (req, res) => {
     const drive = google.drive({ version: 'v3', auth });
     const response = await drive.files.list({ pageSize: 20, fields: 'files(id, name, mimeType, modifiedTime, webViewLink)', q: `name contains '${req.query.q}' and trashed=false` });
     res.json({ files: response.data.files, tokens: auth.credentials });
-  } catch (error) { console.error('Drive search error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/drive/upload', async (req, res) => {
@@ -472,7 +501,7 @@ app.post('/drive/upload', async (req, res) => {
     const drive = google.drive({ version: 'v3', auth });
     const file = await drive.files.create({ resource: { name: req.body.fileName }, media: { mimeType: req.body.mimeType || 'text/plain', body: req.body.content }, fields: 'id, name, webViewLink' });
     res.json({ file: file.data, tokens: auth.credentials });
-  } catch (error) { console.error('Drive upload error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/drive/download/:fileId', async (req, res) => {
@@ -482,7 +511,7 @@ app.get('/drive/download/:fileId', async (req, res) => {
     const drive = google.drive({ version: 'v3', auth });
     const response = await drive.files.get({ fileId: req.params.fileId, alt: 'media' }, { responseType: 'arraybuffer' });
     res.json({ content: Buffer.from(response.data).toString('base64'), tokens: auth.credentials });
-  } catch (error) { console.error('Drive download error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/drive/create-folder', async (req, res) => {
@@ -490,9 +519,109 @@ app.post('/drive/create-folder', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const drive = google.drive({ version: 'v3', auth });
-    const folder = await drive.files.create({ resource: { name: req.body.folderName, mimeType: 'application/vnd.google-apps.folder' }, fields: 'id, name, webViewLink' });
+    const resource = { name: req.body.folderName, mimeType: 'application/vnd.google-apps.folder' };
+    if (req.body.parentId) resource.parents = [req.body.parentId];
+    const folder = await drive.files.create({ resource, fields: 'id, name, webViewLink' });
     res.json({ folder: folder.data, tokens: auth.credentials });
-  } catch (error) { console.error('Drive create folder error:', error); res.status(500).json({ error: error.message }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/drive/search-folder', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    const { name, parentId } = req.query;
+    let q = `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    if (parentId) q += ` and '${parentId}' in parents`;
+    const resp = await drive.files.list({ q, fields: 'files(id,name)', pageSize: 1 });
+    res.json({ success: true, folder: resp.data.files?.[0] || null });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/drive/save-agent', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    const { fileName, content, folderName, mimeType = 'text/markdown' } = req.body;
+    // Trouver/créer dossier Mon Bureau
+    let monBureauFolderId = null;
+    const mbSearch = await drive.files.list({ q: `name='Mon Bureau' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id,name)', pageSize: 1 });
+    if (mbSearch.data.files?.length) { monBureauFolderId = mbSearch.data.files[0].id; }
+    else { const mb = await drive.files.create({ resource: { name: 'Mon Bureau', mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' }); monBureauFolderId = mb.data.id; }
+    // Sous-dossier
+    let targetFolderId = monBureauFolderId;
+    if (folderName) {
+      const subSearch = await drive.files.list({ q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${monBureauFolderId}' in parents and trashed=false`, fields: 'files(id,name)', pageSize: 1 });
+      if (subSearch.data.files?.length) { targetFolderId = subSearch.data.files[0].id; }
+      else { const sub = await drive.files.create({ resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [monBureauFolderId] }, fields: 'id' }); targetFolderId = sub.data.id; }
+    }
+    // Créer ou mettre à jour
+    const existSearch = await drive.files.list({ q: `name='${fileName}' and '${targetFolderId}' in parents and trashed=false`, fields: 'files(id)', pageSize: 1 });
+    let fileId, webViewLink;
+    const { Readable } = await import('stream');
+    if (existSearch.data.files?.length) {
+      fileId = existSearch.data.files[0].id;
+      await drive.files.update({ fileId, media: { mimeType, body: Readable.from([content]) }, fields: 'id,webViewLink' });
+      const info = await drive.files.get({ fileId, fields: 'webViewLink' });
+      webViewLink = info.data.webViewLink;
+    } else {
+      const created = await drive.files.create({ resource: { name: fileName, parents: [targetFolderId] }, media: { mimeType, body: Readable.from([content]) }, fields: 'id,webViewLink' });
+      fileId = created.data.id; webViewLink = created.data.webViewLink;
+    }
+    console.log(`[Drive/SaveAgent] Sauvegardé: ${folderName}/${fileName}`);
+    res.json({ success: true, fileId, webViewLink, fileName });
+  } catch(e) { console.error('[Drive/SaveAgent]', e.message); res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/drive/create-doc-in-folder', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) { const { credentials } = await auth.refreshAccessToken(); auth.setCredentials(credentials); }
+    const drive = google.drive({ version: 'v3', auth });
+    const docs = google.docs({ version: 'v1', auth });
+    const { title, content, folderId } = req.body;
+    if (!folderId) return res.status(400).json({ success: false, error: 'folderId requis' });
+    const created = await drive.files.create({ resource: { name: title, mimeType: 'application/vnd.google-apps.document', parents: [folderId] }, fields: 'id,webViewLink' });
+    const docId = created.data.id;
+    if (content) { await docs.documents.batchUpdate({ documentId: docId, requestBody: { requests: [{ insertText: { location: { index: 1 }, text: content } }] } }); }
+    console.log(`[Drive/CreateDoc] "${title}" créé dans dossier ${folderId}`);
+    res.json({ success: true, docId, webViewLink: created.data.webViewLink, title });
+  } catch(e) { console.error('[Drive/CreateDoc]', e.message); res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/drive/append-to-doc', async (req, res) => {
+  try {
+    const tokens = getTokensFromRequest(req);
+    const auth = getAuthClient(tokens);
+    const drive = google.drive({ version: 'v3', auth });
+    const docs = google.docs({ version: 'v1', auth });
+    const { docTitle, content, folderName } = req.body;
+    let folderId = null;
+    const mbSearch = await drive.files.list({ q: `name='Mon Bureau' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id)', pageSize: 1 });
+    if (mbSearch.data.files?.length) {
+      const monBureauId = mbSearch.data.files[0].id;
+      const subSearch = await drive.files.list({ q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${monBureauId}' in parents and trashed=false`, fields: 'files(id)', pageSize: 1 });
+      folderId = subSearch.data.files?.[0]?.id || monBureauId;
+    }
+    let docId = null;
+    const docSearch = await drive.files.list({ q: `name='${docTitle}' and mimeType='application/vnd.google-apps.document'${folderId ? ` and '${folderId}' in parents` : ''} and trashed=false`, fields: 'files(id,webViewLink)', pageSize: 1 });
+    if (docSearch.data.files?.length) { docId = docSearch.data.files[0].id; }
+    else {
+      const resource = { name: docTitle, mimeType: 'application/vnd.google-apps.document' };
+      if (folderId) resource.parents = [folderId];
+      const created = await drive.files.create({ resource, fields: 'id' });
+      docId = created.data.id;
+      await docs.documents.batchUpdate({ documentId: docId, requestBody: { requests: [{ insertText: { location: { index: 1 }, text: `${docTitle}\n\n` } }] } });
+    }
+    const docInfo = await docs.documents.get({ documentId: docId });
+    const endIndex = docInfo.data.body.content.slice(-1)[0]?.endIndex - 1 || 1;
+    await docs.documents.batchUpdate({ documentId: docId, requestBody: { requests: [{ insertText: { location: { index: endIndex }, text: '\n\n════════════════════════════════\n\n' + content } }] } });
+    const docInfoUpdated = await drive.files.get({ fileId: docId, fields: 'webViewLink' });
+    res.json({ success: true, docId, webViewLink: docInfoUpdated.data.webViewLink });
+  } catch(e) { console.error('[Drive/AppendDoc]', e.message); res.status(500).json({ success: false, error: e.message }); }
 });
 
 // =================
@@ -506,13 +635,13 @@ app.post('/proxy/rss', async (req, res) => {
     const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/rss+xml, application/xml, text/xml, */*', 'Accept-Language': 'fr-FR,fr;q=0.9' }, signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();
-    const events = [];
-    const itemRe = /<item>([\s\S]*?)<\/item>/gi;
-    const entryRe = /<entry>([\s\S]*?)<\/entry>/gi;
     const items = [];
     let m;
+    const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+    const entryRe = /<entry>([\s\S]*?)<\/entry>/gi;
     while ((m = itemRe.exec(text)) !== null) items.push(m[1]);
     while ((m = entryRe.exec(text)) !== null) items.push(m[1]);
+    const events = [];
     items.forEach(item => {
       const get = (tag) => { const cd = item.match(new RegExp('<' + tag + '[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/' + tag + '>', 'i')); if (cd) return cd[1].trim(); const tx = item.match(new RegExp('<' + tag + '[^>]*>([^<]*)<\\/' + tag + '>', 'i')); return tx ? tx[1].trim() : ''; };
       const getAttr = (tag, attr) => { const a = item.match(new RegExp('<' + tag + '[^>]*' + attr + '="([^"]*)"', 'i')); return a ? a[1] : ''; };
@@ -534,9 +663,8 @@ app.post('/proxy/rss', async (req, res) => {
       events.push({ id: link || title+dateStr, title: title.substring(0,150), description: desc.substring(0,250), date: dateStr, heure, horaires: heure ? `${dateStr} à ${heure}` : dateStr, lieu: '', adresse: '', commune: 'Toulouse', url: link, tarif: isFree ? 'Gratuit' : (tarifM ? tarifM[0] : ''), isGratuit: isFree, source: name });
     });
     events.sort((a, b) => (a.date||'').localeCompare(b.date||''));
-    console.log('[RSS Proxy]', name + ':', events.length, 'events');
     res.json({ events, source: name, total: events.length });
-  } catch (error) { console.error('[RSS Proxy] Erreur:', name, error.message); res.status(500).json({ error: error.message, events: [] }); }
+  } catch (error) { res.status(500).json({ error: error.message, events: [] }); }
 });
 
 // =================
@@ -563,9 +691,9 @@ app.get('/openagenda/events', async (req, res) => {
     if (dateTo) params.set('timings[lte]', dateTo + 'T23:59:59');
     if (keyword) params.set('search', keyword);
     const resp = await fetch(`https://api.openagenda.com/v2/agendas/${agendaUid}/events?${params}`, { headers: { 'key': OA_KEY, 'Accept': 'application/json' }, signal: AbortSignal.timeout(10000) });
-    if (!resp.ok) { const txt = await resp.text(); throw new Error(`HTTP ${resp.status}: ${txt.substring(0,100)}`); }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     res.json(await resp.json());
-  } catch(e) { console.error('[OA] Erreur:', e.message); res.status(500).json({ error: e.message, events: [] }); }
+  } catch(e) { res.status(500).json({ error: e.message, events: [] }); }
 });
 
 app.get('/openagenda/toulouse', async (req, res) => {
@@ -580,7 +708,7 @@ app.get('/openagenda/toulouse', async (req, res) => {
       { uid: 59938959, name: 'Colomiers' }, { uid: 50781256, name: 'Launaguet' }
     ];
     const buildUrl = (uid) => { let url = `https://api.openagenda.com/v2/agendas/${uid}/events?size=${size}&key=${OA_KEY}`; if (dateFrom) url += `&timings[gte]=${dateFrom}T00:00:00`; if (dateTo) url += `&timings[lte]=${dateTo}T23:59:59`; return url; };
-    const results = await Promise.allSettled(TOULOUSE_AGENDAS.map(agenda => fetch(buildUrl(agenda.uid), { signal: AbortSignal.timeout(10000) }).then(r => { if (!r.ok) return null; return r.json(); }).catch(e => null)));
+    const results = await Promise.allSettled(TOULOUSE_AGENDAS.map(agenda => fetch(buildUrl(agenda.uid), { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : null).catch(() => null)));
     let allEvents = [];
     results.forEach((result, i) => {
       if (result.status === 'fulfilled' && result.value?.events?.length) {
@@ -601,9 +729,8 @@ app.get('/openagenda/toulouse', async (req, res) => {
     const seen = new Set();
     allEvents = allEvents.filter(e => { if (seen.has(e.id)) return false; seen.add(e.id); return true; });
     allEvents.sort((a, b) => (a.date||'').localeCompare(b.date||'') || (a.heure||'').localeCompare(b.heure||''));
-    console.log(`[OA] Total Toulouse: ${allEvents.length} events`);
     res.json({ events: allEvents, total: allEvents.length });
-  } catch(e) { console.error('[OA] Erreur toulouse:', e.message); res.status(500).json({ error: e.message, events: [] }); }
+  } catch(e) { res.status(500).json({ error: e.message, events: [] }); }
 });
 
 // =================
@@ -661,1337 +788,295 @@ app.get('/spotify/currently-playing', async (req, res) => {
 });
 
 // =================
-
-// =================
-// CINÉMA INDÉPENDANT TOULOUSE - Endpoints backend
-// À ajouter dans server.js avant la section HEALTH & START
-// =================
-
-// Cinémas indépendants Toulouse
-const CINEMAS_INDEPENDANTS = {
-  abc: {
-    name: 'Cinéma ABC',
-    address: '13 rue Saint-Bernard, Toulouse',
-    url: 'https://www.abc-toulouse.fr',
-    programmeUrl: 'https://www.abc-toulouse.fr/programme',
-    lat: 43.6048,
-    lon: 1.4431,
-    style: 'Art et essai, films engagés, documentaires'
-  },
-  cosmograph: {
-    name: 'Cosmograph',
-    address: '10 rue Peyrolières, Toulouse',
-    url: 'https://cosmograph.fr',
-    programmeUrl: 'https://cosmograph.fr/programme',
-    lat: 43.6005,
-    lon: 1.4431,
-    style: 'Cinéma du monde, films rares, répertoire'
-  },
-  cratere: {
-    name: 'Le Cratère',
-    address: '95 allées Jules Guesde, Toulouse',
-    url: 'https://www.lecratere.fr',
-    programmeUrl: 'https://www.lecratere.fr/programme',
-    lat: 43.5964,
-    lon: 1.4474,
-    style: 'Art et essai, jeune public, animations'
-  },
-  veo: {
-    name: 'Véo',
-    address: '15 rue de la Pomme, Toulouse',
-    url: 'https://www.veo-cinema.fr',
-    programmeUrl: 'https://www.veo-cinema.fr/programme',
-    lat: 43.5996,
-    lon: 1.4449,
-    style: 'Films indépendants, avant-premières, répertoire'
-  }
-};
-
-// Infos statiques des cinémas (pas de scraping - APIs publiques)
-app.get('/cinema/infos', (req, res) => {
-  res.json({
-    success: true,
-    cinemas: Object.entries(CINEMAS_INDEPENDANTS).map(([id, c]) => ({
-      id,
-      name: c.name,
-      address: c.address,
-      url: c.url,
-      programmeUrl: c.programmeUrl,
-      style: c.style,
-      mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name + ' ' + c.address)}`
-    }))
-  });
-});
-
-// Recherche AlloCiné pour les séances (cinémas indépendants Toulouse)
-app.get('/cinema/seances', async (req, res) => {
-  try {
-    const { date } = req.query;
-    const targetDate = date || new Date().toISOString().split('T')[0];
-
-    // Utiliser l'API AlloCiné (format non-officiel mais fonctionnel)
-    // Codes AlloCiné des cinémas indépendants Toulouse :
-    const allocineCodes = {
-      abc: 'P0048',        // ABC Toulouse
-      cosmograph: 'P2607', // Cosmograph
-      cratere: 'P0217',    // Le Cratère
-      veo: 'P2171'         // Véo
-    };
-
-    const results = await Promise.allSettled(
-      Object.entries(allocineCodes).map(async ([id, code]) => {
-        try {
-          const url = `https://www.allocine.fr/_/showtimes/theater-${code}/d-${targetDate}/`;
-          const response = await fetch(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/json, text/plain, */*',
-              'Accept-Language': 'fr-FR,fr;q=0.9'
-            },
-            signal: AbortSignal.timeout(8000)
-          });
-
-          if (!response.ok) return { id, films: [], error: `HTTP ${response.status}` };
-
-          const data = await response.json();
-          const cinema = CINEMAS_INDEPENDANTS[id];
-
-          const films = (data.results || []).map(item => ({
-            titre: item.movie?.title || '',
-            titreOriginal: item.movie?.originalTitle || '',
-            duree: item.movie?.runtime ? `${Math.floor(item.movie.runtime / 60)}h${item.movie.runtime % 60}` : '',
-            synopsis: item.movie?.synopsis?.substring(0, 200) || '',
-            note: item.movie?.stats?.userRating?.score || null,
-            affiche: item.movie?.poster?.url || null,
-            genres: (item.movie?.genres || []).map(g => g.tag).join(', '),
-            seances: (item.showtimes?.dubbed || item.showtimes?.original || []).map(s => ({
-              heure: s.startsAt ? new Date(s.startsAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '',
-              version: s.tags?.includes('vf') ? 'VF' : 'VO'
-            })).filter(s => s.heure)
-          })).filter(f => f.titre && f.seances.length > 0);
-
-          return {
-            id,
-            cinema: { name: cinema.name, address: cinema.address, style: cinema.style, url: cinema.url },
-            films,
-            date: targetDate
-          };
-
-        } catch(e) {
-          return { id, films: [], error: e.message };
-        }
-      })
-    );
-
-    const seances = results
-      .filter(r => r.status === 'fulfilled')
-      .map(r => r.value)
-      .filter(r => !r.error || r.films?.length > 0);
-
-    console.log(`[Cinéma] Séances du ${targetDate}: ${seances.reduce((a, c) => a + (c.films?.length || 0), 0)} films`);
-    res.json({ success: true, date: targetDate, cinemas: seances });
-
-  } catch(error) {
-    console.error('[Cinéma] Error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Films recommandés selon les dispos du calendrier
-app.post('/cinema/recommande', async (req, res) => {
-  try {
-    const { tokens, date, googleTokens } = req.body;
-    const targetDate = date || new Date().toISOString().split('T')[0];
-
-    // 1. Récupérer les séances
-    const seancesResp = await fetch(`http://localhost:${process.env.PORT || 3000}/cinema/seances?date=${targetDate}`);
-    const seancesData = await seancesResp.json();
-
-    let dispos = null;
-
-    // 2. Si tokens Google fournis, récupérer les dispos du calendrier
-    if (googleTokens) {
-      try {
-        const auth = getAuthClient(googleTokens);
-        const calendar = google.calendar({ version: 'v3', auth });
-        const dayStart = new Date(targetDate + 'T00:00:00+02:00');
-        const dayEnd = new Date(targetDate + 'T23:59:59+02:00');
-
-        const eventsResp = await calendar.events.list({
-          calendarId: 'primary',
-          timeMin: dayStart.toISOString(),
-          timeMax: dayEnd.toISOString(),
-          singleEvents: true,
-          orderBy: 'startTime'
-        });
-
-        const events = eventsResp.data.items || [];
-        // Créneaux occupés
-        const occupes = events.map(e => ({
-          debut: new Date(e.start?.dateTime || e.start?.date),
-          fin: new Date(e.end?.dateTime || e.end?.date),
-          titre: e.summary
-        }));
-        dispos = { events: occupes };
-
-      } catch(e) {
-        console.warn('[Cinéma] Pas de tokens calendar:', e.message);
-      }
-    }
-
-    // 3. Filtrer les séances selon les dispos
-    const recommandations = [];
-
-    (seancesData.cinemas || []).forEach(cinema => {
-      (cinema.films || []).forEach(film => {
-        const seancesDispo = film.seances.filter(s => {
-          if (!dispos?.events?.length) return true;
-
-          const [h, m] = s.heure.split(':').map(Number);
-          const seanceDebut = new Date(targetDate);
-          seanceDebut.setHours(h, m, 0);
-          const seanceFin = new Date(seanceDebut.getTime() + 120 * 60000); // +2h approx
-
-          // Vérifier qu'aucun event ne chevauche
-          return !dispos.events.some(ev =>
-            ev.debut < seanceFin && ev.fin > seanceDebut
-          );
-        });
-
-        if (seancesDispo.length > 0) {
-          recommandations.push({
-            cinema: cinema.cinema.name,
-            cinemaUrl: cinema.cinema.url,
-            cinemaStyle: cinema.cinema.style,
-            titre: film.titre,
-            titreOriginal: film.titreOriginal,
-            duree: film.duree,
-            note: film.note,
-            genres: film.genres,
-            synopsis: film.synopsis,
-            seancesDispo,
-            seancesTotal: film.seances
-          });
-        }
-      });
-    });
-
-    // Trier par note décroissante
-    recommandations.sort((a, b) => (b.note || 0) - (a.note || 0));
-
-    console.log(`[Cinéma/Recommande] ${recommandations.length} films disponibles le ${targetDate}`);
-    res.json({
-      success: true,
-      date: targetDate,
-      hasCalendar: !!dispos,
-      recommandations: recommandations.slice(0, 10)
-    });
-
-  } catch(error) {
-    console.error('[Cinéma/Recommande] Error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-
-// =================
-// DRIVE AGENT - Endpoints backend
-// À ajouter dans server.js avant HEALTH & START
-// =================
-
-// Rechercher un dossier Drive par nom
-app.get('/drive/search-folder', async (req, res) => {
-  try {
-    const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    const { name, parentId } = req.query;
-
-    let q = `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-    if (parentId) q += ` and '${parentId}' in parents`;
-
-    const resp = await drive.files.list({ q, fields: 'files(id,name)', pageSize: 1 });
-    const folder = resp.data.files?.[0] || null;
-    res.json({ success: true, folder });
-  } catch(e) {
-    console.error('[Drive/SearchFolder]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Sauvegarder un fichier agent dans Drive (crée le dossier si besoin)
-app.post('/drive/save-agent', async (req, res) => {
-  try {
-    const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    const { fileName, content, folderName, mimeType = 'text/markdown' } = req.body;
-
-    // 1. Trouver ou créer le dossier "Mon Bureau"
-    let monBureauFolderId = null;
-    const mbSearch = await drive.files.list({
-      q: `name='Mon Bureau' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: 'files(id,name)', pageSize: 1
-    });
-    if (mbSearch.data.files?.length) {
-      monBureauFolderId = mbSearch.data.files[0].id;
-    } else {
-      const mbCreate = await drive.files.create({
-        resource: { name: 'Mon Bureau', mimeType: 'application/vnd.google-apps.folder' },
-        fields: 'id'
-      });
-      monBureauFolderId = mbCreate.data.id;
-    }
-
-    // 2. Trouver ou créer le sous-dossier (ex: "Mon Bureau — Agents")
-    let targetFolderId = monBureauFolderId;
-    if (folderName) {
-      const subSearch = await drive.files.list({
-        q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${monBureauFolderId}' in parents and trashed=false`,
-        fields: 'files(id,name)', pageSize: 1
-      });
-      if (subSearch.data.files?.length) {
-        targetFolderId = subSearch.data.files[0].id;
-      } else {
-        const subCreate = await drive.files.create({
-          resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [monBureauFolderId] },
-          fields: 'id'
-        });
-        targetFolderId = subCreate.data.id;
-      }
-    }
-
-    // 3. Vérifier si le fichier existe déjà (pour l'écraser)
-    const existSearch = await drive.files.list({
-      q: `name='${fileName}' and '${targetFolderId}' in parents and trashed=false`,
-      fields: 'files(id)', pageSize: 1
-    });
-
-    let fileId, webViewLink;
-
-    if (existSearch.data.files?.length) {
-      // Mettre à jour le fichier existant
-      fileId = existSearch.data.files[0].id;
-      const { Readable } = await import('stream');
-      const stream = Readable.from([content]);
-      await drive.files.update({
-        fileId,
-        media: { mimeType, body: stream },
-        fields: 'id,webViewLink'
-      });
-      const info = await drive.files.get({ fileId, fields: 'webViewLink' });
-      webViewLink = info.data.webViewLink;
-    } else {
-      // Créer le fichier
-      const { Readable } = await import('stream');
-      const stream = Readable.from([content]);
-      const created = await drive.files.create({
-        resource: { name: fileName, parents: [targetFolderId] },
-        media: { mimeType, body: stream },
-        fields: 'id,webViewLink'
-      });
-      fileId = created.data.id;
-      webViewLink = created.data.webViewLink;
-    }
-
-    console.log(`[Drive/SaveAgent] Sauvegardé: ${folderName}/${fileName}`);
-    res.json({ success: true, fileId, webViewLink, fileName });
-
-  } catch(e) {
-    console.error('[Drive/SaveAgent]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Créer un Google Doc dans un dossier Drive spécifique (par ID)
-app.post('/drive/create-doc-in-folder', async (req, res) => {
-  try {
-    const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 60000) {
-      const { credentials } = await auth.refreshAccessToken();
-      auth.setCredentials(credentials);
-    }
-    const drive = google.drive({ version: 'v3', auth });
-    const docs = google.docs({ version: 'v1', auth });
-    const { title, content, folderId } = req.body;
-
-    if (!folderId) return res.status(400).json({ success: false, error: 'folderId requis' });
-
-    // 1. Créer le Google Doc dans le dossier cible
-    const resource = {
-      name: title,
-      mimeType: 'application/vnd.google-apps.document',
-      parents: [folderId]
-    };
-    const created = await drive.files.create({ resource, fields: 'id,webViewLink' });
-    const docId = created.data.id;
-    const webViewLink = created.data.webViewLink;
-
-    // 2. Insérer le contenu dans le Doc
-    if (content) {
-      await docs.documents.batchUpdate({
-        documentId: docId,
-        requestBody: {
-          requests: [{
-            insertText: {
-              location: { index: 1 },
-              text: content
-            }
-          }]
-        }
-      });
-    }
-
-    console.log(`[Drive/CreateDoc] "${title}" créé dans dossier ${folderId}`);
-    res.json({ success: true, docId, webViewLink, title });
-
-  } catch(e) {
-    console.error('[Drive/CreateDoc]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-
-app.post('/drive/append-to-doc', async (req, res) => {
-  try {
-    const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    const docs = google.docs({ version: 'v1', auth });
-    const { docTitle, content, folderName } = req.body;
-
-    // 1. Trouver le dossier parent
-    let folderId = null;
-    const mbSearch = await drive.files.list({
-      q: `name='Mon Bureau' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: 'files(id)', pageSize: 1
-    });
-    if (mbSearch.data.files?.length) {
-      const monBureauId = mbSearch.data.files[0].id;
-      const subSearch = await drive.files.list({
-        q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${monBureauId}' in parents and trashed=false`,
-        fields: 'files(id)', pageSize: 1
-      });
-      folderId = subSearch.data.files?.[0]?.id || monBureauId;
-    }
-
-    // 2. Chercher le Google Doc hebdomadaire
-    let docId = null;
-    const docSearch = await drive.files.list({
-      q: `name='${docTitle}' and mimeType='application/vnd.google-apps.document'${folderId ? ` and '${folderId}' in parents` : ''} and trashed=false`,
-      fields: 'files(id,webViewLink)', pageSize: 1
-    });
-
-    if (docSearch.data.files?.length) {
-      docId = docSearch.data.files[0].id;
-    } else {
-      // Créer le Google Doc
-      const resource = {
-        name: docTitle,
-        mimeType: 'application/vnd.google-apps.document'
-      };
-      if (folderId) resource.parents = [folderId];
-      const created = await drive.files.create({ resource, fields: 'id' });
-      docId = created.data.id;
-
-      // Initialiser avec un titre
-      await docs.documents.batchUpdate({
-        documentId: docId,
-        requestBody: {
-          requests: [{
-            insertText: {
-              location: { index: 1 },
-              text: `${docTitle}\n\n`
-            }
-          }]
-        }
-      });
-    }
-
-    // 3. Récupérer la longueur actuelle du doc
-    const docInfo = await docs.documents.get({ documentId: docId });
-    const endIndex = docInfo.data.body.content.slice(-1)[0]?.endIndex - 1 || 1;
-
-    // 4. Ajouter le nouveau contenu
-    const separator = '\n\n════════════════════════════════\n\n';
-    await docs.documents.batchUpdate({
-      documentId: docId,
-      requestBody: {
-        requests: [{
-          insertText: {
-            location: { index: endIndex },
-            text: separator + content
-          }
-        }]
-      }
-    });
-
-    const docInfoUpdated = await drive.files.get({ fileId: docId, fields: 'webViewLink' });
-    console.log(`[Drive/AppendDoc] Ajouté dans: ${docTitle}`);
-    res.json({ success: true, docId, webViewLink: docInfoUpdated.data.webViewLink });
-
-  } catch(e) {
-    console.error('[Drive/AppendDoc]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-
-// =================
-// TISSÉO - Endpoints backend
-// API Open Data Toulouse Métropole
-// Clé gratuite : https://data.toulouse-metropole.fr/pages/api/
+// TISSÉO (1 seule définition propre)
 // =================
 
 const TISSEO_API_KEY = process.env.TISSEO_API_KEY || '';
 const TISSEO_BASE = 'https://api.tisseo.fr/v2';
+const ARRETS_IDS = { gallieni: null, langlade: null };
 
-const ARRETS_IDS = {
-  gallieni: null, // On cherche dynamiquement
-  langlade: null
-};
-
-// Prochains passages pour un arrêt
 app.get('/tisseo/prochains', async (req, res) => {
   try {
     const { arret = 'gallieni', nb = 8 } = req.query;
 
     if (!TISSEO_API_KEY) {
-      return res.json({
-        success: true, arret, demo: true,
-        passages: [
-          { ligne: '5', direction: 'Borderouge', attente: '3 min', heure: new Date(Date.now()+3*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 3, realtime: true },
-          { ligne: '152', direction: 'Saint-Michel', attente: '7 min', heure: new Date(Date.now()+7*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 7, realtime: true },
-          { ligne: '5', direction: 'Borderouge', attente: '13 min', heure: new Date(Date.now()+13*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 13, realtime: false }
-        ]
-      });
+      return res.json({ success: true, arret, demo: true, passages: [
+        { ligne: '5', direction: 'Borderouge', attente: '3 min', heure: new Date(Date.now()+3*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 3, realtime: true },
+        { ligne: '152', direction: 'Saint-Michel', attente: '7 min', heure: new Date(Date.now()+7*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 7, realtime: true },
+        { ligne: '5', direction: 'Borderouge', attente: '13 min', heure: new Date(Date.now()+13*60000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), attenteMin: 13, realtime: false }
+      ]});
     }
 
-    // Chercher l'arrêt par nom si pas encore trouvé
     let stopId = ARRETS_IDS[arret];
     if (!stopId) {
-      const searchName = arret === 'gallieni' ? 'Gallieni' : 'Langlade';
-      const searchResp = await fetch(
-        `${TISSEO_BASE}/stops_area.json?key=${TISSEO_API_KEY}&displayLines=1&srsName=EPSG:4326&term=${encodeURIComponent(searchName)}`,
-        { signal: AbortSignal.timeout(5000) }
-      );
+      const searchName = arret === 'gallieni' ? 'Gallieni' : arret === 'langlade' ? 'Langlade' : arret;
+      const searchResp = await fetch(`${TISSEO_BASE}/stops_area.json?key=${TISSEO_API_KEY}&displayLines=1&srsName=EPSG:4326&term=${encodeURIComponent(searchName)}`, { signal: AbortSignal.timeout(5000) });
       const searchData = await searchResp.json();
       const stops = searchData.stopsArea?.stopsArea || [];
-      if (stops.length > 0) {
-        stopId = stops[0].id;
-        ARRETS_IDS[arret] = stopId;
-        console.log(`[Tisséo] Arrêt trouvé: ${searchName} → ${stopId}`);
-      }
+      if (stops.length > 0) { stopId = stops[0].id; ARRETS_IDS[arret] = stopId; console.log(`[Tisséo] Arrêt trouvé: ${searchName} → ${stopId}`); }
     }
 
-    if (!stopId) {
-      return res.json({ success: false, error: `Arrêt ${arret} non trouvé` });
-    }
+    if (!stopId) return res.json({ success: false, error: `Arrêt ${arret} non trouvé` });
 
-    const params = new URLSearchParams({
-      key: TISSEO_API_KEY,
-      stopAreaId: stopId,
-      number: nb,
-      srsName: 'EPSG:4326'
-    });
-
-    const response = await fetch(`${TISSEO_BASE}/departures.json?${params}`, {
-      signal: AbortSignal.timeout(5000)
-    });
+    const params = new URLSearchParams({ key: TISSEO_API_KEY, stopAreaId: stopId, number: nb, srsName: 'EPSG:4326' });
+    const response = await fetch(`${TISSEO_BASE}/departures.json?${params}`, { signal: AbortSignal.timeout(5000) });
     const data = await response.json();
     const now = new Date();
-
     const passages = (data.departures?.departure || []).map(dep => {
       const dt = new Date(dep.dateTime);
       const diffMin = Math.round((dt - now) / 60000);
-      return {
-        ligne: dep.line?.shortName || dep.line?.longName || '?',
-        direction: dep.destination?.name || '',
-        heure: dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
-        attente: diffMin <= 0 ? 'À quai' : diffMin === 1 ? '1 min' : `${diffMin} min`,
-        attenteMin: diffMin,
-        realtime: dep.realTime === '1',
-        mode: dep.line?.transportMode?.nameTransportMode || 'Bus'
-      };
+      return { ligne: dep.line?.shortName || dep.line?.longName || '?', direction: dep.destination?.name || '', heure: dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }), attente: diffMin <= 0 ? 'À quai' : diffMin === 1 ? '1 min' : `${diffMin} min`, attenteMin: diffMin, realtime: dep.realTime === '1', mode: dep.line?.transportMode?.nameTransportMode || 'Bus' };
     });
-
     console.log(`[Tisséo] ${arret} (${stopId}): ${passages.length} passages`);
     res.json({ success: true, arret, stopId, passages, updatedAt: new Date().toISOString() });
-
-  } catch(error) {
-    console.error('[Tisséo] Error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
+  } catch(error) { console.error('[Tisséo] Error:', error.message); res.status(500).json({ success: false, error: error.message }); }
 });
 
-// Rechercher un arrêt par nom
 app.get('/tisseo/search', async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.status(400).json({ success: false, error: 'Paramètre q requis' });
-
     if (!TISSEO_API_KEY) return res.json({ success: true, demo: true, arrets: [] });
-
-    const response = await fetch(
-      `${TISSEO_BASE}/stops_area.json?key=${TISSEO_API_KEY}&displayLines=1&srsName=EPSG:4326&term=${encodeURIComponent(q)}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
+    const response = await fetch(`${TISSEO_BASE}/stops_area.json?key=${TISSEO_API_KEY}&displayLines=1&srsName=EPSG:4326&term=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(5000) });
     const data = await response.json();
-    const arrets = (data.stopsArea?.stopsArea || []).slice(0, 10).map(s => ({
-      id: s.id,
-      name: s.name,
-      city: s.city?.name || 'Toulouse',
-      lignes: (s.lines?.line || []).map(l => l.shortName || l.longName).join(', ')
-    }));
-
+    const arrets = (data.stopsArea?.stopsArea || []).slice(0, 10).map(s => ({ id: s.id, name: s.name, city: s.city?.name || 'Toulouse', lignes: (s.lines?.line || []).map(l => l.shortName || l.longName).join(', ') }));
     res.json({ success: true, arrets });
-  } catch(error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// Perturbations en cours
 app.get('/tisseo/perturbations', async (req, res) => {
   try {
     if (!TISSEO_API_KEY) return res.json({ success: true, demo: true, perturbations: [] });
-    const response = await fetch(`${TISSEO_BASE}/disruptions.json?key=${TISSEO_API_KEY}`, {
-      signal: AbortSignal.timeout(5000)
-    });
+    const response = await fetch(`${TISSEO_BASE}/disruptions.json?key=${TISSEO_API_KEY}`, { signal: AbortSignal.timeout(5000) });
     const data = await response.json();
-    const perturbations = (data.disruptions?.disruption || []).slice(0, 5).map(d => ({
-      titre: d.title || '',
-      lignes: (d.lines?.line || []).map(l => l.shortName).join(', '),
-      debut: d.startDate,
-      fin: d.endDate,
-      message: d.comment || ''
-    }));
+    const perturbations = (data.disruptions?.disruption || []).slice(0, 5).map(d => ({ titre: d.title || '', lignes: (d.lines?.line || []).map(l => l.shortName).join(', '), debut: d.startDate, fin: d.endDate, message: d.comment || '' }));
     res.json({ success: true, perturbations });
-  } catch(error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
-
-// Prochains passages pour un arrêt
-app.get('/tisseo/prochains', async (req, res) => {
-  try {
-    const { arret = 'gallieni', nb = 8 } = req.query;
-    const stopId = ARRETS_IDS[arret];
-
-    if (!stopId) {
-      return res.status(400).json({ success: false, error: `Arrêt inconnu: ${arret}` });
-    }
-
-    if (!TISSEO_API_KEY) {
-      // Mode démo si pas de clé
-      return res.json({
-        success: true,
-        arret,
-        demo: true,
-        passages: [
-          { ligne: 'A', direction: 'Basso Cambo', attente: '3 min', heure: '14:32', realtime: true },
-          { ligne: 'B', direction: 'Borderouge', attente: '7 min', heure: '14:36', realtime: true },
-          { ligne: 'A', direction: 'Balma-Gramont', attente: '10 min', heure: '14:39', realtime: true }
-        ]
-      });
-    }
-
-    const params = new URLSearchParams({
-      key: TISSEO_API_KEY,
-      stopAreaId: stopId,
-      number: nb,
-      srsName: 'EPSG:4326'
-    });
-
-    const response = await fetch(`${TISSEO_BASE}/departures.json?${params}`, {
-      signal: AbortSignal.timeout(5000)
-    });
-
-    const data = await response.json();
-    const now = new Date();
-
-    const passages = (data.departures?.departure || []).map(dep => {
-      const dt = new Date(dep.dateTime);
-      const diffMin = Math.round((dt - now) / 60000);
-      return {
-        ligne: dep.line?.shortName || dep.line?.longName || '?',
-        direction: dep.destination?.name || '',
-        heure: dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
-        attente: diffMin <= 0 ? 'À quai' : diffMin === 1 ? '1 min' : `${diffMin} min`,
-        attenteMin: diffMin,
-        realtime: dep.realTime === '1',
-        mode: dep.line?.transportMode?.nameTransportMode || 'Bus'
-      };
-    });
-
-    console.log(`[Tisséo] ${arret}: ${passages.length} passages`);
-    res.json({ success: true, arret, passages, updatedAt: new Date().toISOString() });
-
-  } catch(error) {
-    console.error('[Tisséo] Error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Rechercher un arrêt par nom
-app.get('/tisseo/search', async (req, res) => {
-  try {
-    const { q } = req.query;
-    if (!q) return res.status(400).json({ success: false, error: 'Paramètre q requis' });
-
-    if (!TISSEO_API_KEY) {
-      return res.json({ success: true, demo: true, arrets: [] });
-    }
-
-    const params = new URLSearchParams({
-      key: TISSEO_API_KEY,
-      srsName: 'EPSG:4326',
-      term: q
-    });
-
-    const response = await fetch(`${TISSEO_BASE}/stops_area.json?${params}`, {
-      signal: AbortSignal.timeout(5000)
-    });
-
-    const data = await response.json();
-    const arrets = (data.stopsArea?.stopsArea || []).slice(0, 10).map(s => ({
-      id: s.id,
-      name: s.name,
-      city: s.city?.name || 'Toulouse',
-      lignes: (s.lines?.line || []).map(l => l.shortName || l.longName).join(', ')
-    }));
-
-    res.json({ success: true, arrets });
-  } catch(error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Perturbations en cours
-app.get('/tisseo/perturbations', async (req, res) => {
-  try {
-    if (!TISSEO_API_KEY) {
-      return res.json({ success: true, demo: true, perturbations: [] });
-    }
-
-    const params = new URLSearchParams({ key: TISSEO_API_KEY });
-    const response = await fetch(`${TISSEO_BASE}/disruptions.json?${params}`, {
-      signal: AbortSignal.timeout(5000)
-    });
-
-    const data = await response.json();
-    const perturbations = (data.disruptions?.disruption || []).slice(0, 5).map(d => ({
-      titre: d.title || '',
-      lignes: (d.lines?.line || []).map(l => l.shortName).join(', '),
-      debut: d.startDate,
-      fin: d.endDate,
-      message: d.comment || ''
-    }));
-
-    res.json({ success: true, perturbations });
-  } catch(error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 
 // =================
-// VÉLÔTOULOUSE - Endpoints backend
-// API GBFS gratuite, sans clé, temps réel
+// VÉLÔTOULOUSE
 // =================
 
-// Cache stations 1 minute
 let _veloCache = null;
 let _veloCacheTime = 0;
 
 async function fetchVeloData() {
   const now = Date.now();
   if (_veloCache && now - _veloCacheTime < 60000) return _veloCache;
-
   try {
-    // 1. Récupérer les infos statiques (noms + positions)
-    const infoResp = await fetch('https://api.cyclocity.fr/contracts/toulouse/gbfs/station_information.json', {
-      signal: AbortSignal.timeout(5000)
-    });
-    const infoData = await infoResp.json();
-
-    // 2. Récupérer les dispo temps réel
-    const statusResp = await fetch('https://api.cyclocity.fr/contracts/toulouse/gbfs/station_status.json', {
-      signal: AbortSignal.timeout(5000)
-    });
-    const statusData = await statusResp.json();
-
-    // Fusionner les deux
+    const [infoData, statusData] = await Promise.all([
+      fetch('https://api.cyclocity.fr/contracts/toulouse/gbfs/station_information.json', { signal: AbortSignal.timeout(5000) }).then(r => r.json()),
+      fetch('https://api.cyclocity.fr/contracts/toulouse/gbfs/station_status.json', { signal: AbortSignal.timeout(5000) }).then(r => r.json())
+    ]);
     const statusMap = {};
-    (statusData.data?.stations || []).forEach(s => {
-      statusMap[s.station_id] = s;
-    });
-
+    (statusData.data?.stations || []).forEach(s => { statusMap[s.station_id] = s; });
     const stations = (infoData.data?.stations || []).map(s => {
       const status = statusMap[s.station_id] || {};
-      return {
-        id: s.station_id,
-        name: s.name.replace(/VélôToulouse - /i, '').replace(/Vélo Toulouse - /i, '').trim(),
-        lat: s.lat,
-        lon: s.lon,
-        capacity: s.capacity || 0,
-        availableBikes: status.num_bikes_available || 0,
-        availableDocks: status.num_docks_available || 0,
-        isInstalled: status.is_installed === 1,
-        isRenting: status.is_renting === 1,
-        lastUpdated: status.last_reported || 0
-      };
+      return { id: s.station_id, name: s.name.replace(/VélôToulouse - /i, '').replace(/Vélo Toulouse - /i, '').trim(), lat: s.lat, lon: s.lon, capacity: s.capacity || 0, availableBikes: status.num_bikes_available || 0, availableDocks: status.num_docks_available || 0, isInstalled: status.is_installed === 1, isRenting: status.is_renting === 1, lastUpdated: status.last_reported || 0 };
     }).filter(s => s.isInstalled && s.isRenting);
-
-    _veloCache = stations;
-    _veloCacheTime = now;
+    _veloCache = stations; _veloCacheTime = now;
     return stations;
-
-  } catch(e) {
-    console.error('[Vélo] Erreur GBFS:', e.message);
-    return _veloCache || [];
-  }
+  } catch(e) { console.error('[Vélo] Erreur GBFS:', e.message); return _veloCache || []; }
 }
 
-// Stations les plus proches d'un point
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000, dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
 app.get('/velo/stations', async (req, res) => {
   try {
-    const lat = parseFloat(req.query.lat) || 43.5986;
-    const lon = parseFloat(req.query.lon) || 1.4441;
-    const nb = parseInt(req.query.nb) || 10;
-
+    const lat = parseFloat(req.query.lat) || 43.5986, lon = parseFloat(req.query.lon) || 1.4441, nb = parseInt(req.query.nb) || 10;
     const stations = await fetchVeloData();
-
-    // Calculer distances et trier
-    function haversine(lat1, lon1, lat2, lon2) {
-      const R = 6371000;
-      const dLat = (lat2 - lat1) * Math.PI / 180;
-      const dLon = (lon2 - lon1) * Math.PI / 180;
-      const a = Math.sin(dLat/2)**2 +
-                Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
-                Math.sin(dLon/2)**2;
-      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    }
-
-    const withDist = stations
-      .map(s => ({ ...s, dist: Math.round(haversine(lat, lon, s.lat, s.lon)) }))
-      .filter(s => s.dist < 2000)
-      .sort((a, b) => a.dist - b.dist)
-      .slice(0, nb);
-
-    console.log(`[Vélo] ${withDist.length} stations proches de (${lat}, ${lon})`);
-    res.json({
-      success: true,
-      stations: withDist,
-      total: stations.length,
-      updatedAt: new Date(_veloCacheTime).toISOString()
-    });
-
-  } catch(e) {
-    console.error('[Vélo] Error:', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
+    const withDist = stations.map(s => ({ ...s, dist: Math.round(haversine(lat, lon, s.lat, s.lon)) })).filter(s => s.dist < 2000).sort((a, b) => a.dist - b.dist).slice(0, nb);
+    res.json({ success: true, stations: withDist, total: stations.length, updatedAt: new Date(_veloCacheTime).toISOString() });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// Toutes les stations (pour la carte)
 app.get('/velo/all', async (req, res) => {
   try {
     const stations = await fetchVeloData();
     res.json({ success: true, stations, total: stations.length });
-  } catch(e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-
 // =================
-// CINÉMA INDÉPENDANT TOULOUSE - Backend
-// Sources : sites officiels + AlloCiné
+// CINÉMA INDÉPENDANT TOULOUSE (1 seule définition propre)
 // =================
 
 const CINEMAS = {
-  abc: {
-    name: 'Cinéma ABC',
-    allocineCode: 'P0071',
-    url: 'https://www.abc-toulouse.fr',
-    programmeUrl: 'https://www.abc-toulouse.fr/programme',
-    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0071.html',
-    style: 'Art et essai · Films engagés'
-  },
-  cosmograph: {
-    name: 'American Cosmograph',
-    allocineCode: 'P0235',
-    url: 'https://www.americancosmograph.fr',
-    programmeUrl: 'https://www.americancosmograph.fr/programme',
-    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0235.html',
-    style: 'Cinéma du monde · Répertoire'
-  },
-  cratere: {
-    name: 'Le Cratère',
-    allocineCode: 'P0056',
-    url: 'https://www.cinemalecratere.fr',
-    programmeUrl: 'https://www.cinemalecratere.fr/programmation',
-    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0056.html',
-    style: 'Art et essai · Tarifs réduits'
-  },
-  veo: {
-    name: 'Véo Cartoucherie',
-    allocineCode: 'G0699',
-    url: 'https://cartoucherie.veocinemas.fr',
-    programmeUrl: 'https://cartoucherie.veocinemas.fr/horaires',
-    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=G0699.html',
-    style: 'Indépendant · Avant-premières'
-  }
+  abc:        { name: 'Cinéma ABC',         allocineCode: 'P0071', url: 'https://www.abc-toulouse.fr',           allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0071.html', style: 'Art et essai · Films engagés' },
+  cosmograph: { name: 'American Cosmograph', allocineCode: 'P0235', url: 'https://www.americancosmograph.fr',    allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0235.html', style: 'Cinéma du monde · Répertoire' },
+  cratere:    { name: 'Le Cratère',          allocineCode: 'P0056', url: 'https://www.cinemalecratere.fr',        allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=P0056.html', style: 'Art et essai · Tarifs réduits' },
+  veo:        { name: 'Véo Cartoucherie',    allocineCode: 'G0699', url: 'https://cartoucherie.veocinemas.fr',   allocineUrl: 'https://www.allocine.fr/seance/salle_gen_csalle=G0699.html', style: 'Indépendant · Avant-premières' }
 };
 
-// Cache 30 minutes
-let _cinemaCache = null;
-let _cinemaCacheTime = 0;
-const CACHE_TTL = 30 * 60 * 1000;
+let _cinemaCache = null, _cinemaCacheTime = 0;
+const CINEMA_CACHE_TTL = 30 * 60 * 1000;
 
-// Scraper toulourama.fr qui agrège toutes les séances
-async function fetchSeancesToulourama(date) {
-  const targetDate = date || new Date().toISOString().split('T')[0];
-
-  try {
-    const response = await fetch(`https://www.toulourama.fr/?date=${targetDate}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'fr-FR,fr;q=0.9'
-      },
-      signal: AbortSignal.timeout(10000)
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const html = await response.text();
-
-    // Parser le HTML pour extraire les séances
-    const films = [];
-    const cinemaNames = Object.values(CINEMAS).map(c => c.name);
-
-    // Regex pour extraire les blocs de films
-    const filmBlocks = html.match(/<div[^>]*class="[^"]*film[^"]*"[^>]*>[\s\S]*?(?=<div[^>]*class="[^"]*film[^"]*"|$)/gi) || [];
-
-    for (const block of filmBlocks) {
-      // Extraire le titre
-      const titleMatch = block.match(/<h\d[^>]*>([^<]+)<\/h\d>/i) ||
-                         block.match(/class="[^"]*title[^"]*"[^>]*>([^<]+)</i);
-      if (!titleMatch) continue;
-      const titre = titleMatch[1].trim();
-
-      // Extraire les cinémas et séances
-      const cinemaMatches = block.matchAll(/(?:ABC|Cosmograph|Cratère|Véo)[^<]*/gi);
-      const seances = [];
-
-      for (const cm of cinemaMatches) {
-        const cinema = cm[0];
-        const heures = block.match(/\d{1,2}[h:]\d{2}/g) || [];
-        heures.forEach(h => {
-          seances.push({
-            cinema: cinema.trim().substring(0, 30),
-            heure: h.replace(':', 'h')
-          });
-        });
-      }
-
-      if (seances.length > 0) {
-        films.push({ titre, seances, date: targetDate });
-      }
-    }
-
-    return films;
-  } catch(e) {
-    console.warn('[Cinéma] Toulourama scraping échoué:', e.message);
-    return null;
-  }
-}
-
-// Fallback : fetch AlloCiné directement
 async function fetchSeancesAllocine(cinemaCode, date) {
-  const targetDate = date || new Date().toISOString().split('T')[0];
-
   try {
-    const url = `https://www.allocine.fr/_/showtimes/theater-${cinemaCode}/d-${targetDate}/`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json, */*',
-        'Accept-Language': 'fr-FR,fr;q=0.9',
-        'X-Requested-With': 'XMLHttpRequest'
-      },
-      signal: AbortSignal.timeout(8000)
-    });
-
+    const url = `https://www.allocine.fr/_/showtimes/theater-${cinemaCode}/d-${date}/`;
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json, */*', 'Accept-Language': 'fr-FR,fr;q=0.9', 'X-Requested-With': 'XMLHttpRequest' }, signal: AbortSignal.timeout(8000) });
     if (!response.ok) return [];
     const data = await response.json();
-
     return (data.results || []).map(item => ({
-      titre: item.movie?.title || '',
-      titreOriginal: item.movie?.originalTitle || '',
+      titre: item.movie?.title || '', titreOriginal: item.movie?.originalTitle || '',
       duree: item.movie?.runtime ? `${Math.floor(item.movie.runtime/60)}h${String(item.movie.runtime%60).padStart(2,'0')}` : '',
       synopsis: (item.movie?.synopsis || '').substring(0, 200),
       note: item.movie?.stats?.userRating?.score?.toFixed(1) || null,
       affiche: item.movie?.poster?.url || null,
       genres: (item.movie?.genres || []).map(g => g.tag).join(', '),
-      seances: [
-        ...(item.showtimes?.dubbed || []),
-        ...(item.showtimes?.original || []),
-        ...(item.showtimes?.local || [])
-      ].map(s => ({
-        heure: s.startsAt ? new Date(s.startsAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' }) : '',
-        version: (s.tags || []).includes('vf') ? 'VF' : (s.tags || []).includes('vost') ? 'VOST' : 'VO'
-      })).filter(s => s.heure)
+      seances: [...(item.showtimes?.dubbed||[]), ...(item.showtimes?.original||[]), ...(item.showtimes?.local||[])].map(s => ({ heure: s.startsAt ? new Date(s.startsAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' }) : '', version: (s.tags||[]).includes('vf') ? 'VF' : (s.tags||[]).includes('vost') ? 'VOST' : 'VO' })).filter(s => s.heure)
     })).filter(f => f.titre && f.seances.length > 0);
-
-  } catch(e) {
-    console.warn(`[Cinéma] AlloCiné ${cinemaCode} échoué:`, e.message);
-    return [];
-  }
+  } catch(e) { console.warn(`[Cinéma] AlloCiné ${cinemaCode} échoué:`, e.message); return []; }
 }
 
-// Endpoint principal : séances de tous les cinémas indépendants
 app.get('/cinema/seances', async (req, res) => {
   try {
-    const { date } = req.query;
-    const targetDate = date || new Date().toISOString().split('T')[0];
+    const targetDate = req.query.date || new Date().toISOString().split('T')[0];
     const now = Date.now();
-
-    // Vérifier cache
-    if (_cinemaCache && now - _cinemaCacheTime < CACHE_TTL) {
-      return res.json({ success: true, ...(_cinemaCache), cached: true });
-    }
-
-    // Fetch toutes les cinémas en parallèle via AlloCiné
-    const results = await Promise.allSettled(
-      Object.entries(CINEMAS).map(async ([id, cinema]) => {
-        const films = await fetchSeancesAllocine(cinema.allocineCode, targetDate);
-        return {
-          id,
-          cinema: {
-            name: cinema.name,
-            style: cinema.style,
-            url: cinema.url,
-            allocineUrl: cinema.allocineUrl
-          },
-          films,
-          date: targetDate
-        };
-      })
-    );
-
-    const cinemas = results
-      .filter(r => r.status === 'fulfilled')
-      .map(r => r.value);
-
+    if (_cinemaCache && now - _cinemaCacheTime < CINEMA_CACHE_TTL) return res.json({ success: true, ..._cinemaCache, cached: true });
+    const results = await Promise.allSettled(Object.entries(CINEMAS).map(async ([id, cinema]) => ({ id, cinema: { name: cinema.name, style: cinema.style, url: cinema.url, allocineUrl: cinema.allocineUrl }, films: await fetchSeancesAllocine(cinema.allocineCode, targetDate), date: targetDate })));
+    const cinemas = results.filter(r => r.status === 'fulfilled').map(r => r.value);
     const totalFilms = cinemas.reduce((acc, c) => acc + c.films.length, 0);
-    console.log(`[Cinéma] ${totalFilms} films pour ${targetDate}`);
-
     const payload = { date: targetDate, cinemas, totalFilms };
-    _cinemaCache = payload;
-    _cinemaCacheTime = now;
-
+    _cinemaCache = payload; _cinemaCacheTime = now;
+    console.log(`[Cinéma] ${totalFilms} films pour ${targetDate}`);
     res.json({ success: true, ...payload });
-
-  } catch(error) {
-    console.error('[Cinéma] Error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// Infos des cinémas (statique)
 app.get('/cinema/infos', (req, res) => {
-  res.json({
-    success: true,
-    cinemas: Object.entries(CINEMAS).map(([id, c]) => ({
-      id, ...c,
-      mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name + ' Toulouse')}`
-    }))
-  });
+  res.json({ success: true, cinemas: Object.entries(CINEMAS).map(([id, c]) => ({ id, ...c, mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(c.name + ' Toulouse')}` })) });
 });
 
-// Recommandations selon dispos agenda
 app.post('/cinema/recommande', async (req, res) => {
   try {
     const { date, googleTokens } = req.body;
     const targetDate = date || new Date().toISOString().split('T')[0];
-
-    // Récupérer les séances
-    const seancesResp = await fetch(`http://localhost:${process.env.PORT || 3000}/cinema/seances?date=${targetDate}`);
+    const seancesResp = await fetch(`http://localhost:${PORT}/cinema/seances?date=${targetDate}`);
     const seancesData = await seancesResp.json();
-
     let eventsOccupes = [];
-
-    // Si tokens Google, récupérer les RDV du jour
     if (googleTokens) {
       try {
         const auth = getAuthClient(googleTokens);
         const calendar = google.calendar({ version: 'v3', auth });
-        const dayStart = new Date(targetDate + 'T00:00:00');
-        const dayEnd = new Date(targetDate + 'T23:59:59');
-        const eventsResp = await calendar.events.list({
-          calendarId: 'primary',
-          timeMin: dayStart.toISOString(),
-          timeMax: dayEnd.toISOString(),
-          singleEvents: true, orderBy: 'startTime'
-        });
-        eventsOccupes = (eventsResp.data.items || []).map(e => ({
-          debut: new Date(e.start?.dateTime || e.start?.date),
-          fin: new Date(e.end?.dateTime || e.end?.date),
-          titre: e.summary
-        }));
+        const eventsResp = await calendar.events.list({ calendarId: 'primary', timeMin: new Date(targetDate + 'T00:00:00').toISOString(), timeMax: new Date(targetDate + 'T23:59:59').toISOString(), singleEvents: true, orderBy: 'startTime' });
+        eventsOccupes = (eventsResp.data.items || []).map(e => ({ debut: new Date(e.start?.dateTime || e.start?.date), fin: new Date(e.end?.dateTime || e.end?.date), titre: e.summary }));
       } catch(e) { console.warn('[Cinéma] Agenda non dispo:', e.message); }
     }
-
-    // Filtrer les séances selon les dispos
     const recommandations = [];
     for (const cinema of (seancesData.cinemas || [])) {
       for (const film of cinema.films) {
         const seancesDispo = film.seances.filter(s => {
           if (!s.heure) return false;
           const [h, m] = s.heure.split('h').map(Number);
-          const debut = new Date(targetDate);
-          debut.setHours(h, m || 0, 0);
+          const debut = new Date(targetDate); debut.setHours(h, m || 0, 0);
           const fin = new Date(debut.getTime() + ((parseInt(film.duree) || 120) * 60000));
-          // Pas de chevauchement avec les RDV
           return !eventsOccupes.some(ev => ev.debut < fin && ev.fin > debut);
         });
-
-        if (seancesDispo.length > 0) {
-          recommandations.push({
-            cinema: cinema.cinema.name,
-            cinemaUrl: cinema.cinema.allocineUrl,
-            cinemaStyle: cinema.cinema.style,
-            ...film,
-            seancesDispo
-          });
-        }
+        if (seancesDispo.length > 0) recommandations.push({ cinema: cinema.cinema.name, cinemaUrl: cinema.cinema.allocineUrl, cinemaStyle: cinema.cinema.style, ...film, seancesDispo });
       }
     }
-
-    // Trier par note
     recommandations.sort((a, b) => (parseFloat(b.note) || 0) - (parseFloat(a.note) || 0));
-
-    res.json({
-      success: true,
-      date: targetDate,
-      hasCalendar: eventsOccupes.length > 0,
-      recommandations: recommandations.slice(0, 12)
-    });
-
-  } catch(error) {
-    console.error('[Cinéma/Recommande]', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
+    res.json({ success: true, date: targetDate, hasCalendar: eventsOccupes.length > 0, recommandations: recommandations.slice(0, 12) });
+  } catch(error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-
 // =================
-// GOOGLE PLACES AUTOCOMPLETE
+// PLACES AUTOCOMPLETE
 // =================
 
 app.get('/places/autocomplete', async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.status(400).json({ success: false, predictions: [] });
-
     const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
-    const params = new URLSearchParams({
-      input: q,
-      key: MAPS_KEY,
-      language: 'fr',
-      components: 'country:fr',
-      location: '43.6047,1.4442', // Toulouse
-      radius: 30000,
-      types: 'establishment|geocode'
-    });
-
-    const resp = await fetch(
-      `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`,
-      { signal: AbortSignal.timeout(3000) }
-    );
+    const params = new URLSearchParams({ input: q, key: MAPS_KEY, language: 'fr', components: 'country:fr', location: '43.6047,1.4442', radius: 30000, types: 'establishment|geocode' });
+    const resp = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`, { signal: AbortSignal.timeout(3000) });
     const data = await resp.json();
-    
-    res.json({
-      success: true,
-      predictions: (data.predictions || []).slice(0, 5)
-    });
-  } catch(e) {
-    console.warn('[Places] Erreur:', e.message);
-    res.json({ success: true, predictions: [] });
-  }
+    res.json({ success: true, predictions: (data.predictions || []).slice(0, 5) });
+  } catch(e) { res.json({ success: true, predictions: [] }); }
 });
 
-
 // =================
-// YOUTUBE SEARCH (pour le player musique)
+// YOUTUBE SEARCH
 // =================
 
 app.get('/youtube/search', async (req, res) => {
   try {
     const { q, limit = 1 } = req.query;
     if (!q) return res.status(400).json({ success: false, items: [] });
-
     const YT_KEY = process.env.YOUTUBE_API_KEY || 'AIzaSyDi4FQgEY8rTRYv1K7unY-m_ra3cgBEPC4';
-    const params = new URLSearchParams({
-      key: YT_KEY,
-      q: q + ' audio officiel',
-      part: 'snippet',
-      type: 'video',
-      maxResults: limit,
-      videoCategoryId: '10', // Musique
-      relevanceLanguage: 'fr'
-    });
-
-    const resp = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`, {
-      signal: AbortSignal.timeout(5000)
-    });
+    const params = new URLSearchParams({ key: YT_KEY, q: q + ' audio officiel', part: 'snippet', type: 'video', maxResults: limit, videoCategoryId: '10', relevanceLanguage: 'fr' });
+    const resp = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`, { signal: AbortSignal.timeout(5000) });
     const data = await resp.json();
-
-    if (data.error) {
-      console.warn('[YouTube] API Error:', data.error.message);
-      return res.json({ success: false, items: [], error: data.error.message });
-    }
-
+    if (data.error) return res.json({ success: false, items: [], error: data.error.message });
     res.json({ success: true, items: data.items || [] });
-  } catch(e) {
-    console.warn('[YouTube] Error:', e.message);
-    res.json({ success: false, items: [] });
-  }
+  } catch(e) { res.json({ success: false, items: [] }); }
 });
 
-
 // =================
-// ELEVENLABS TTS — Méditation
+// ELEVENLABS TTS
 // =================
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || '';
-
-// Voix recommandées pour la méditation (douces, féminines)
-const ELEVEN_VOICES = {
-  'aria':      '9BWtsMINqrJLrRacOk9x', // Aria — douce et naturelle
-  'sarah':     'EXAVITQu4vr4xnSDxMaL', // Sarah — apaisante
-  'charlotte': 'XB0fDUnXU5powFXDhCwa', // Charlotte — douce
-  'laura':     'FGY2WhTYpPnrIDTdsKH5', // Laura — calme
-  'default':   '9BWtsMINqrJLrRacOk9x', // Aria par défaut
-};
+const ELEVEN_VOICES = { 'aria': '9BWtsMINqrJLrRacOk9x', 'sarah': 'EXAVITQu4vr4xnSDxMaL', 'charlotte': 'XB0fDUnXU5powFXDhCwa', 'laura': 'FGY2WhTYpPnrIDTdsKH5', 'default': '9BWtsMINqrJLrRacOk9x' };
 
 app.get('/elevenlabs/voices', async (req, res) => {
-  try {
-    const key = ELEVEN_API_KEY;
-    if (!key) return res.json({ success: false, error: 'Clé ElevenLabs non configurée' });
-    
-    const resp = await fetch('https://api.elevenlabs.io/v1/voices', {
-      headers: { 'xi-api-key': key },
-      signal: AbortSignal.timeout(5000)
-    });
-    const data = await resp.json();
-    res.json({ success: true, voices: data.voices || [] });
-  } catch(e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  if (!ELEVEN_API_KEY) return res.json({ success: false, error: 'Clé ElevenLabs non configurée' });
+  try { const resp = await fetch('https://api.elevenlabs.io/v1/voices', { headers: { 'xi-api-key': ELEVEN_API_KEY }, signal: AbortSignal.timeout(5000) }); res.json({ success: true, voices: (await resp.json()).voices || [] }); }
+  catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post('/elevenlabs/tts', async (req, res) => {
+  const { text, voiceId, stability = 0.75, similarityBoost = 0.85 } = req.body;
+  if (!ELEVEN_API_KEY) return res.status(400).json({ success: false, error: 'Clé ElevenLabs non configurée' });
+  if (!text) return res.status(400).json({ success: false, error: 'Texte requis' });
   try {
-    const { text, voiceId, stability = 0.75, similarityBoost = 0.85 } = req.body;
-    const key = ELEVEN_API_KEY;
-    
-    if (!key) return res.status(400).json({ success: false, error: 'Clé ElevenLabs non configurée' });
-    if (!text) return res.status(400).json({ success: false, error: 'Texte requis' });
-
     const vid = voiceId || ELEVEN_VOICES.default;
-    
-    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}`, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': key,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg'
-      },
-      body: JSON.stringify({
-        text,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: {
-          stability,
-          similarity_boost: similarityBoost,
-          style: 0.2,
-          use_speaker_boost: false
-        }
-      }),
-      signal: AbortSignal.timeout(30000)
-    });
-
-    if (!resp.ok) {
-      const err = await resp.text();
-      return res.status(resp.status).json({ success: false, error: err });
-    }
-
-    // Streamer l'audio directement
+    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}`, { method: 'POST', headers: { 'xi-api-key': ELEVEN_API_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' }, body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability, similarity_boost: similarityBoost, style: 0.2, use_speaker_boost: false } }), signal: AbortSignal.timeout(30000) });
+    if (!resp.ok) { const err = await resp.text(); return res.status(resp.status).json({ success: false, error: err }); }
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Cache-Control', 'no-cache');
-    const buffer = await resp.arrayBuffer();
-    res.send(Buffer.from(buffer));
-
-  } catch(e) {
-    console.error('[ElevenLabs]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
+    res.send(Buffer.from(await resp.arrayBuffer()));
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-
 // =================
-// GOOGLE CLOUD TTS — Méditation
+// GOOGLE CLOUD TTS
 // =================
 
 const GOOGLE_TTS_KEY = process.env.GOOGLE_TTS_KEY || '';
 
 app.post('/tts/synthesize', async (req, res) => {
+  const { text, ssml, voiceName = 'fr-FR-Studio-A', speakingRate = 0.38, pitch = -5.0 } = req.body;
+  if (!GOOGLE_TTS_KEY) return res.status(400).json({ success: false, error: 'Clé Google TTS non configurée' });
+  if (!text && !ssml) return res.status(400).json({ success: false, error: 'Texte requis' });
   try {
-    const { text, ssml, voiceName = 'fr-FR-Studio-A', speakingRate = 0.38, pitch = -5.0 } = req.body;
-    const key = GOOGLE_TTS_KEY;
-
-    if (!key) return res.status(400).json({ success: false, error: 'Clé Google TTS non configurée' });
-    if (!text && !ssml) return res.status(400).json({ success: false, error: 'Texte requis' });
-
-    // Nettoyer le texte — remplacer les points multiples par des pauses
     const cleanedText = (text || '').replace(/\.{3,}/g, '... ').replace(/\s{2,}/g, ' ').trim();
     const input = ssml ? { ssml } : { text: cleanedText };
-
-    const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${key}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        input,
-        voice: { languageCode: 'fr-FR', name: voiceName, ssmlGender: 'FEMALE' },
-        audioConfig: {
-          audioEncoding: 'MP3',
-          speakingRate,
-          pitch,
-          effectsProfileId: ['headphone-class-device']
-        }
-      }),
-      signal: AbortSignal.timeout(15000)
-    });
-
+    const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_KEY}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input, voice: { languageCode: 'fr-FR', name: voiceName, ssmlGender: 'FEMALE' }, audioConfig: { audioEncoding: 'MP3', speakingRate, pitch, effectsProfileId: ['headphone-class-device'] } }), signal: AbortSignal.timeout(15000) });
     const data = await resp.json();
     if (data.error) return res.status(400).json({ success: false, error: data.error.message });
     if (!data.audioContent) return res.status(400).json({ success: false, error: 'Pas de contenu audio' });
-
     res.json({ success: true, audioContent: data.audioContent });
-
-  } catch(e) {
-    console.error('[Google TTS]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// =================
 // HEALTH & START
 // =================
 
-app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '2.0.0', status: 'ok', features: ['claude', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'drive-agent', 'tisseo', 'velo'] }); });
+app.get('/', (req, res) => { res.json({ name: 'Mon Bureau Backend', version: '3.0.0', status: 'ok', features: ['claude', 'gemini', 'agents', 'calendar', 'drive', 'contacts', 'maps', 'meteo', 'cinema', 'tisseo', 'velo', 'spotify', 'youtube', 'elevenlabs'] }); });
 app.get('/health', (req, res) => { res.json({ status: 'ok', timestamp: Date.now() }); });
 
 app.listen(PORT, () => {
-  console.log(`Mon Bureau Backend v2 - Port ${PORT} - Routes: Claude, Agents, Calendar, Drive, Contacts, Maps, Météo`);
+  console.log(`Mon Bureau Backend v3 - Port ${PORT}`);
+  console.log(`Gemini: ${GEMINI_API_KEY ? '✅ configuré' : '❌ manquant'}`);
+  console.log(`Claude: ${process.env.ANTHROPIC_API_KEY ? '✅ configuré' : '❌ manquant'}`);
+  console.log(`Tisséo: ${TISSEO_API_KEY ? '✅ configuré' : '❌ manquant (mode démo)'}`);
 });
