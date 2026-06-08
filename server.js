@@ -116,6 +116,17 @@ app.get('/gemini/status', async (req, res) => {
 // CLAUDE — uniquement fiches de lecture et dossiers (qualité max)
 // =================
 
+// Contexte de date injecté dans les prompts Claude : évite que le modèle
+// "corrige" ou rejette des infos récentes (sport, actu) qu'il ne connaît pas
+// car sa connaissance interne s'arrête avant la date du jour.
+function dateContexte() {
+  const today = new Date().toLocaleDateString('fr-FR', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    timeZone: 'Europe/Paris'
+  });
+  return `Nous sommes le ${today}. Ta connaissance interne peut être périmée : ne corrige pas, ne fact-checke pas et ne remets pas en cause les informations factuelles récentes (résultats sportifs, actualités, événements) présentes dans le contenu fourni — considère qu'elles peuvent être exactes même si elles te surprennent.`;
+}
+
 app.post('/claude/summarize', async (req, res) => {
   try {
     const { text, type } = req.body;
@@ -123,7 +134,7 @@ app.post('/claude/summarize', async (req, res) => {
     if (type === 'article') prompt = `Résume cet article en 3 points clés (max 50 mots par point). Sois concis et factuel.\n\nArticle:\n${text}`;
     else if (type === 'note') prompt = `Résume cette note en gardant les informations essentielles.\n\nNote:\n${text}`;
     else if (type === 'meeting') prompt = `Résume cet événement/réunion : quoi, quand, avec qui, objectifs.\n\nÉvénement:\n${text}`;
-    const message = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 500, messages: [{ role: 'user', content: prompt }] });
+    const message = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 500, system: dateContexte(), messages: [{ role: 'user', content: prompt }] });
     res.json({ success: true, summary: message.content[0].text, usage: message.usage });
   } catch (error) { console.error('Summarize error:', error); res.status(500).json({ success: false, error: error.message }); }
 });
@@ -132,7 +143,7 @@ app.post('/claude/factcheck', async (req, res) => {
   try {
     const { title, content, url } = req.body;
     const prompt = `Tu es un fact-checker expert. Analyse cet article et évalue sa crédibilité.\n\nArticle:\nTitre: ${title}\nURL: ${url}\nContenu: ${content}\n\nFournis une analyse structurée en JSON avec:\n{\n  "score": 0-100,\n  "verdict": "Fiable" | "Douteux" | "Faux" | "Non vérifiable",\n  "points_positifs": [],\n  "points_negatifs": [],\n  "recommandation": "courte phrase"\n}\nRéponds UNIQUEMENT avec le JSON.`;
-    const message = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 800, messages: [{ role: 'user', content: prompt }] });
+    const message = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 800, system: dateContexte() + ` Ne baisse JAMAIS le score uniquement parce qu'une information est postérieure à ta connaissance : juge la crédibilité sur la cohérence interne, la source et le ton, pas sur ce que tu crois savoir des faits récents.`, messages: [{ role: 'user', content: prompt }] });
     let analysis;
     try { analysis = JSON.parse(message.content[0].text.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim()); }
     catch (e) { analysis = { score: 50, verdict: "Non vérifiable", points_positifs: [], points_negatifs: [], recommandation: "Vérifier manuellement" }; }
@@ -143,7 +154,7 @@ app.post('/claude/factcheck', async (req, res) => {
 app.post('/claude/chat', async (req, res) => {
   try {
     const { message: userMessage, context } = req.body;
-    let systemPrompt = `Tu es l'assistant personnel de Sandra. Tu as accès à ses données :`;
+    let systemPrompt = `Tu es l'assistant personnel de Sandra. ${dateContexte()}\n\nTu as accès à ses données :`;
     if (context?.tasks?.length) systemPrompt += `\n\nTÂCHES EN COURS:\n${context.tasks.join('\n')}`;
     if (context?.events?.length) systemPrompt += `\n\nÉVÉNEMENTS À VENIR:\n${context.events.join('\n')}`;
     if (context?.notes?.length) systemPrompt += `\n\nNOTES RÉCENTES:\n${context.notes.join('\n')}`;
