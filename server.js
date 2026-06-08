@@ -119,12 +119,14 @@ app.get('/gemini/status', async (req, res) => {
 // Contexte de date injecté dans les prompts Claude : évite que le modèle
 // "corrige" ou rejette des infos récentes (sport, actu) qu'il ne connaît pas
 // car sa connaissance interne s'arrête avant la date du jour.
-function dateContexte() {
-  const today = new Date().toLocaleDateString('fr-FR', {
+function dateDuJour() {
+  return new Date().toLocaleDateString('fr-FR', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     timeZone: 'Europe/Paris'
   });
-  return `Nous sommes le ${today}. Ta connaissance interne peut être périmée : ne corrige pas, ne fact-checke pas et ne remets pas en cause les informations factuelles récentes (résultats sportifs, actualités, événements) présentes dans le contenu fourni — considère qu'elles peuvent être exactes même si elles te surprennent.`;
+}
+function dateContexte() {
+  return `Nous sommes le ${dateDuJour()}. Ta connaissance interne peut être périmée : ne corrige pas, ne fact-checke pas et ne remets pas en cause les informations factuelles récentes (résultats sportifs, actualités, événements) présentes dans le contenu fourni — considère qu'elles peuvent être exactes même si elles te surprennent.`;
 }
 
 app.post('/claude/summarize', async (req, res) => {
@@ -142,11 +144,35 @@ app.post('/claude/summarize', async (req, res) => {
 app.post('/claude/factcheck', async (req, res) => {
   try {
     const { title, content, url } = req.body;
-    const prompt = `Tu es un fact-checker expert. Analyse cet article et évalue sa crédibilité.\n\nArticle:\nTitre: ${title}\nURL: ${url}\nContenu: ${content}\n\nFournis une analyse structurée en JSON avec:\n{\n  "score": 0-100,\n  "verdict": "Fiable" | "Douteux" | "Faux" | "Non vérifiable",\n  "points_positifs": [],\n  "points_negatifs": [],\n  "recommandation": "courte phrase"\n}\nRéponds UNIQUEMENT avec le JSON.`;
-    const message = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 800, system: dateContexte() + ` Ne baisse JAMAIS le score uniquement parce qu'une information est postérieure à ta connaissance : juge la crédibilité sur la cohérence interne, la source et le ton, pas sur ce que tu crois savoir des faits récents.`, messages: [{ role: 'user', content: prompt }] });
+    const prompt = `Vérifie la crédibilité de cet article. Utilise la recherche web pour confronter les affirmations factuelles importantes à des sources fiables, surtout pour les événements récents.\n\nArticle:\nTitre: ${title}\nURL: ${url}\nContenu: ${content}\n\nUne fois tes vérifications faites, fournis ton analyse en JSON :\n{\n  "score": 0-100,\n  "verdict": "Fiable" | "Douteux" | "Faux" | "Non vérifiable",\n  "points_positifs": [],\n  "points_negatifs": [],\n  "recommandation": "courte phrase"\n}\nTermine ta réponse par ce JSON uniquement, sans texte après.`;
+
+    const systemFC = `Nous sommes le ${dateDuJour()}. Tu es un fact-checker rigoureux. Ta connaissance interne s'arrête avant cette date : pour tout fait récent, vérifie-le via la recherche web AVANT de juger. Ne baisse jamais le score d'un article uniquement parce qu'une information dépasse ta connaissance — vérifie d'abord, puis juge sur la base des sources trouvées, de la cohérence interne et de la concordance avec des sources fiables.`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      system: systemFC,
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    // Avec la recherche web, la réponse contient plusieurs blocs
+    // (recherches + résultats + texte). On ne garde que le texte final.
+    const textOut = message.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+
     let analysis;
-    try { analysis = JSON.parse(message.content[0].text.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim()); }
-    catch (e) { analysis = { score: 50, verdict: "Non vérifiable", points_positifs: [], points_negatifs: [], recommandation: "Vérifier manuellement" }; }
+    try {
+      let jsonStr = textOut.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const first = jsonStr.indexOf('{');
+      const last = jsonStr.lastIndexOf('}');
+      if (first !== -1 && last !== -1) jsonStr = jsonStr.slice(first, last + 1);
+      analysis = JSON.parse(jsonStr);
+    } catch (e) {
+      analysis = { score: 50, verdict: "Non vérifiable", points_positifs: [], points_negatifs: [], recommandation: "Vérifier manuellement" };
+    }
     res.json({ success: true, analysis, usage: message.usage });
   } catch (error) { console.error('Fact-check error:', error); res.status(500).json({ success: false, error: error.message }); }
 });
