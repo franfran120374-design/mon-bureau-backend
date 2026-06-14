@@ -448,6 +448,52 @@ app.get('/tisseo/prochains', async (req, res) => {
 });
 
 // =================
+// AGENTS IA (proxy Anthropic)
+// =================
+
+// Le front envoie { messages, system } et lit la réponse via data.content[0].text
+// (format brut de l'API Anthropic). La clé reste côté serveur (variable d'env Render).
+app.post('/agents/chat', async (req, res) => {
+  try {
+    const { messages, system, model, max_tokens } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages[] requis' });
+    }
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY manquante côté serveur' });
+    }
+
+    const payload = {
+      model: model || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+      max_tokens: max_tokens || 1024,
+      messages
+    };
+    if (system) payload.system = system;
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await r.json();
+    if (!r.ok) {
+      console.error('[agents/chat] Anthropic error:', r.status, data);
+      return res.status(r.status).json(data);
+    }
+    res.json(data); // réponse Anthropic telle quelle
+  } catch (e) {
+    console.error('[agents/chat] erreur:', e);
+    res.status(500).json({ error: 'Erreur proxy Anthropic', detail: String(e?.message || e) });
+  }
+});
+
+// =================
 // HEALTH
 // =================
 
