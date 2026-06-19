@@ -36,32 +36,28 @@ const SCOPES = [
 // ROUTES OAuth
 // =================
 
-// Génère l'URL de connexion Google
 app.get('/auth/google/url', (req, res) => {
-  // L'URL frontend où renvoyer après auth (passée en query param)
   const frontendUrl = req.query.frontend || '';
-  
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: SCOPES,
     prompt: 'consent',
-    state: frontendUrl // pour rediriger vers le frontend après
+    state: frontendUrl
   });
   res.json({ url: authUrl });
 });
 
-// Callback OAuth - récupère les tokens et les renvoie au frontend
 app.get('/auth/google/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code) return res.send('<h1>Erreur: code manquant</h1>');
-  
+
   try {
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
-    
+
     const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
     const { data } = await oauth2.userinfo.get();
-    
+
     const accountData = {
       id: data.id,
       email: data.email,
@@ -70,12 +66,9 @@ app.get('/auth/google/callback', async (req, res) => {
       tokens: tokens,
       addedAt: Date.now()
     };
-    
-    // Encoder en base64 pour passer dans l'URL
-    const encoded = Buffer.from(JSON.stringify(accountData)).toString('base64');
+
     const frontendUrl = state || '/';
-    
-    // Page qui transmet les tokens au frontend via postMessage et localStorage
+
     res.send(`<!DOCTYPE html>
 <html>
 <head>
@@ -99,30 +92,12 @@ app.get('/auth/google/callback', async (req, res) => {
   </div>
   <script>
     const accountData = ${JSON.stringify(accountData)};
-    
-    // Méthode 1: postMessage à la fenêtre parente
     if (window.opener) {
-      try {
-        window.opener.postMessage({ 
-          type: 'GOOGLE_AUTH_SUCCESS', 
-          account: accountData 
-        }, '*');
-      } catch(e) {
-        console.error('postMessage failed:', e);
-      }
+      try { window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', account: accountData }, '*'); } catch(e) {}
     }
-    
-    // Méthode 2: localStorage partagé (si même origine)
-    try {
-      localStorage.setItem('pendingGoogleAuth', JSON.stringify(accountData));
-    } catch(e) {
-      console.error('localStorage failed:', e);
-    }
-    
-    // Fermer après 1.5s
+    try { localStorage.setItem('pendingGoogleAuth', JSON.stringify(accountData)); } catch(e) {}
     setTimeout(() => {
       window.close();
-      // Si window.close ne marche pas, redirection
       if (!window.closed) {
         document.body.innerHTML = '<div class="card"><h1>✓ Connexion OK</h1><p>Tu peux fermer cette fenêtre et retourner à l\\'app.</p></div>';
       }
@@ -137,8 +112,9 @@ app.get('/auth/google/callback', async (req, res) => {
 });
 
 // =================
-// Helper: créer un client OAuth depuis les tokens reçus du frontend
+// Helpers
 // =================
+
 function getAuthClient(tokens) {
   if (!tokens) throw new Error('Tokens manquants');
   const client = new google.auth.OAuth2(
@@ -150,18 +126,11 @@ function getAuthClient(tokens) {
   return client;
 }
 
-// Helper: récupère les tokens depuis le header Authorization
 function getTokensFromRequest(req) {
   const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) {
-    throw new Error('Header Authorization manquant');
-  }
+  if (!auth || !auth.startsWith('Bearer ')) throw new Error('Header Authorization manquant');
   const encoded = auth.substring(7);
-  try {
-    return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
-  } catch (e) {
-    throw new Error('Tokens invalides');
-  }
+  return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
 }
 
 // =================
@@ -173,7 +142,6 @@ app.get('/calendar/events', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const calendar = google.calendar({ version: 'v3', auth });
-    
     const response = await calendar.events.list({
       calendarId: 'primary',
       timeMin: req.query.timeMin || new Date().toISOString(),
@@ -181,15 +149,8 @@ app.get('/calendar/events', async (req, res) => {
       singleEvents: true,
       orderBy: 'startTime'
     });
-    
-    // Renvoie aussi les tokens mis à jour si refresh
-    const newTokens = auth.credentials;
-    res.json({ 
-      events: response.data.items,
-      tokens: newTokens // Le frontend met à jour son localStorage
-    });
+    res.json({ events: response.data.items, tokens: auth.credentials });
   } catch (error) {
-    console.error('Calendar list error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -199,18 +160,9 @@ app.post('/calendar/events', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const calendar = google.calendar({ version: 'v3', auth });
-    
-    const event = await calendar.events.insert({
-      calendarId: 'primary',
-      resource: req.body
-    });
-    
-    res.json({ 
-      event: event.data,
-      tokens: auth.credentials
-    });
+    const event = await calendar.events.insert({ calendarId: 'primary', resource: req.body });
+    res.json({ event: event.data, tokens: auth.credentials });
   } catch (error) {
-    console.error('Calendar create error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -220,18 +172,9 @@ app.delete('/calendar/events/:eventId', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const calendar = google.calendar({ version: 'v3', auth });
-    
-    await calendar.events.delete({
-      calendarId: 'primary',
-      eventId: req.params.eventId
-    });
-    
-    res.json({ 
-      success: true,
-      tokens: auth.credentials
-    });
+    await calendar.events.delete({ calendarId: 'primary', eventId: req.params.eventId });
+    res.json({ success: true, tokens: auth.credentials });
   } catch (error) {
-    console.error('Calendar delete error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -241,19 +184,9 @@ app.patch('/calendar/events/:eventId', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const calendar = google.calendar({ version: 'v3', auth });
-    
-    const event = await calendar.events.patch({
-      calendarId: 'primary',
-      eventId: req.params.eventId,
-      resource: req.body
-    });
-    
-    res.json({ 
-      event: event.data,
-      tokens: auth.credentials
-    });
+    const event = await calendar.events.patch({ calendarId: 'primary', eventId: req.params.eventId, resource: req.body });
+    res.json({ event: event.data, tokens: auth.credentials });
   } catch (error) {
-    console.error('Calendar update error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -267,20 +200,14 @@ app.get('/drive/files', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const drive = google.drive({ version: 'v3', auth });
-    
     const response = await drive.files.list({
       pageSize: parseInt(req.query.pageSize) || 20,
       fields: 'files(id, name, mimeType, modifiedTime, size, webViewLink)',
       q: req.query.query || "trashed=false",
       orderBy: 'modifiedTime desc'
     });
-    
-    res.json({ 
-      files: response.data.files,
-      tokens: auth.credentials
-    });
+    res.json({ files: response.data.files, tokens: auth.credentials });
   } catch (error) {
-    console.error('Drive list error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -290,19 +217,13 @@ app.get('/drive/search', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const drive = google.drive({ version: 'v3', auth });
-    
     const response = await drive.files.list({
       pageSize: 20,
       fields: 'files(id, name, mimeType, modifiedTime, webViewLink)',
       q: `name contains '${req.query.q}' and trashed=false`
     });
-    
-    res.json({ 
-      files: response.data.files,
-      tokens: auth.credentials
-    });
+    res.json({ files: response.data.files, tokens: auth.credentials });
   } catch (error) {
-    console.error('Drive search error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -312,22 +233,13 @@ app.post('/drive/upload', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const drive = google.drive({ version: 'v3', auth });
-    
     const file = await drive.files.create({
       resource: { name: req.body.fileName },
-      media: { 
-        mimeType: req.body.mimeType || 'text/plain', 
-        body: req.body.content 
-      },
+      media: { mimeType: req.body.mimeType || 'text/plain', body: req.body.content },
       fields: 'id, name, webViewLink'
     });
-    
-    res.json({ 
-      file: file.data,
-      tokens: auth.credentials
-    });
+    res.json({ file: file.data, tokens: auth.credentials });
   } catch (error) {
-    console.error('Drive upload error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -337,18 +249,9 @@ app.get('/drive/download/:fileId', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const drive = google.drive({ version: 'v3', auth });
-    
-    const response = await drive.files.get({
-      fileId: req.params.fileId,
-      alt: 'media'
-    }, { responseType: 'arraybuffer' });
-    
-    res.json({
-      content: Buffer.from(response.data).toString('base64'),
-      tokens: auth.credentials
-    });
+    const response = await drive.files.get({ fileId: req.params.fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+    res.json({ content: Buffer.from(response.data).toString('base64'), tokens: auth.credentials });
   } catch (error) {
-    console.error('Drive download error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -358,34 +261,23 @@ app.post('/drive/create-folder', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const auth = getAuthClient(tokens);
     const drive = google.drive({ version: 'v3', auth });
-    
     const folder = await drive.files.create({
-      resource: {
-        name: req.body.folderName,
-        mimeType: 'application/vnd.google-apps.folder'
-      },
+      resource: { name: req.body.folderName, mimeType: 'application/vnd.google-apps.folder' },
       fields: 'id, name, webViewLink'
     });
-    
-    res.json({
-      folder: folder.data,
-      tokens: auth.credentials
-    });
+    res.json({ folder: folder.data, tokens: auth.credentials });
   } catch (error) {
-    console.error('Drive create folder error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // =================
 // TISSÉO — Prochains passages
-// API Open Data Tisséo (clé gérée côté backend)
 // =================
 
-const TISSEO_API_KEY = 'f39e1e02-80f5-4342-bfd6-72981063f1b6';
+const TISSEO_API_KEY = process.env.TISSEO_API_KEY || 'f39e1e02-80f5-4342-bfd6-72981063f1b6';
 const TISSEO_BASE = 'https://api.tisseo.fr/v2';
 
-// IDs des arrêts (récupérés via l'API Tisséo stops_area)
 const TISSEO_ARRETS = {
   gallieni: { name: 'Gallieni', id: null, term: 'Gallieni' },
   langlade: { name: 'Langlade', id: null, term: 'Langlade' },
@@ -397,8 +289,7 @@ async function tisseoResolveStopId(term) {
   const r = await fetch(`${TISSEO_BASE}/stops_area.json?${params}`, { signal: AbortSignal.timeout(5000) });
   const d = await r.json();
   const stops = d.stopsArea?.stopsArea || [];
-  if (!stops.length) return null;
-  return stops[0].id;
+  return stops.length ? stops[0].id : null;
 }
 
 app.get('/tisseo/prochains', async (req, res) => {
@@ -407,22 +298,10 @@ app.get('/tisseo/prochains', async (req, res) => {
     const arretConfig = TISSEO_ARRETS[arret.toLowerCase()];
     if (!arretConfig) return res.status(400).json({ success: false, error: `Arrêt inconnu: ${arret}` });
 
-    // Résoudre l'ID si pas encore connu
-    if (!arretConfig.id) {
-      arretConfig.id = await tisseoResolveStopId(arretConfig.term);
-    }
+    if (!arretConfig.id) arretConfig.id = await tisseoResolveStopId(arretConfig.term);
+    if (!arretConfig.id) return res.json({ success: false, arret, passages: [], error: 'Arrêt non trouvé' });
 
-    if (!arretConfig.id) {
-      return res.json({ success: false, arret, passages: [], error: 'Arrêt non trouvé dans Tisséo' });
-    }
-
-    const params = new URLSearchParams({
-      key: TISSEO_API_KEY,
-      stopAreaId: arretConfig.id,
-      number: nb,
-      srsName: 'EPSG:4326'
-    });
-
+    const params = new URLSearchParams({ key: TISSEO_API_KEY, stopAreaId: arretConfig.id, number: nb, srsName: 'EPSG:4326' });
     const r = await fetch(`${TISSEO_BASE}/departures.json?${params}`, { signal: AbortSignal.timeout(5000) });
     const d = await r.json();
     const now = new Date();
@@ -434,7 +313,7 @@ app.get('/tisseo/prochains', async (req, res) => {
         ligne: dep.line?.shortName || dep.line?.longName || '?',
         direction: dep.destination?.name || '',
         heure: dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
-        attente: diffMin <= 0 ? '⬆️ Maintenant' : diffMin === 1 ? '1 min' : `${diffMin} min`,
+        attente: diffMin <= 0 ? 'Maintenant' : diffMin === 1 ? '1 min' : `${diffMin} min`,
         attenteMin: diffMin,
         realtime: dep.realTime === '1'
       };
@@ -442,8 +321,80 @@ app.get('/tisseo/prochains', async (req, res) => {
 
     res.json({ success: true, arret, name: arretConfig.name, passages });
   } catch (e) {
-    console.error('[Tisséo]', e.message);
     res.json({ success: false, arret: req.query.arret, passages: [], error: e.message });
+  }
+});
+
+// =================
+// API PROXY — YouTube, Last.fm
+// =================
+
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
+
+// YouTube Search Proxy
+app.get('/proxy/youtube/search', async (req, res) => {
+  if (!YOUTUBE_API_KEY) return res.status(503).json({ error: 'YouTube API key not configured' });
+  try {
+    const params = new URLSearchParams({
+      part: 'snippet', q: req.query.q || '', type: 'video',
+      maxResults: req.query.maxResults || '5', key: YOUTUBE_API_KEY
+    });
+    const r = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Last.fm Proxy
+app.get('/proxy/lastfm/:method', async (req, res) => {
+  if (!LASTFM_API_KEY) return res.status(503).json({ error: 'Last.fm API key not configured' });
+  try {
+    const params = new URLSearchParams({
+      method: req.params.method, api_key: LASTFM_API_KEY, format: 'json', ...req.query
+    });
+    const r = await fetch(`https://ws.audioscrobbler.com/2.0/?${params}`);
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Tisséo generic proxy (for agent-tisseo.js)
+app.get('/proxy/tisseo/:endpoint', async (req, res) => {
+  try {
+    const params = new URLSearchParams({ key: TISSEO_API_KEY, displayLines: 1, srsName: 'EPSG:4326', ...req.query });
+    const r = await fetch(`https://api.tisseo.fr/v2/${req.params.endpoint}?${params}`);
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Google Maps Directions proxy
+app.get('/proxy/maps/directions', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'Google Maps API key not configured' });
+  try {
+    const params = new URLSearchParams({ ...req.query, key: apiKey });
+    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`);
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// RSS Proxy (for podcast fallback)
+app.post('/proxy/rss', async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'URL required' });
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const text = await r.text();
+    res.type('application/xml').send(text);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -451,8 +402,6 @@ app.get('/tisseo/prochains', async (req, res) => {
 // AGENTS IA (proxy Anthropic)
 // =================
 
-// Le front envoie { messages, system } et lit la réponse via data.content[0].text
-// (format brut de l'API Anthropic). La clé reste côté serveur (variable d'env Render).
 app.post('/agents/chat', async (req, res) => {
   try {
     const { messages, system, model, max_tokens } = req.body || {};
@@ -460,12 +409,10 @@ app.post('/agents/chat', async (req, res) => {
       return res.status(400).json({ error: 'messages[] requis' });
     }
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: 'ANTHROPIC_API_KEY manquante côté serveur' });
-    }
+    if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY manquante' });
 
     const payload = {
-      model: model || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+      model: model || 'claude-sonnet-4-6',
       max_tokens: max_tokens || 1024,
       messages
     };
@@ -473,22 +420,14 @@ app.post('/agents/chat', async (req, res) => {
 
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-      },
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify(payload)
     });
 
     const data = await r.json();
-    if (!r.ok) {
-      console.error('[agents/chat] Anthropic error:', r.status, data);
-      return res.status(r.status).json(data);
-    }
-    res.json(data); // réponse Anthropic telle quelle
+    if (!r.ok) return res.status(r.status).json(data);
+    res.json(data);
   } catch (e) {
-    console.error('[agents/chat] erreur:', e);
     res.status(500).json({ error: 'Erreur proxy Anthropic', detail: String(e?.message || e) });
   }
 });
@@ -498,11 +437,7 @@ app.post('/agents/chat', async (req, res) => {
 // =================
 
 app.get('/', (req, res) => {
-  res.json({ 
-    name: 'Mon Bureau Backend',
-    version: '1.0.0',
-    status: 'ok'
-  });
+  res.json({ name: 'Mon Bureau Backend', version: '2.1.0', status: 'ok' });
 });
 
 app.get('/health', (req, res) => {
