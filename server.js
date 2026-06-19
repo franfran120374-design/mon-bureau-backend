@@ -385,6 +385,140 @@ app.get('/proxy/maps/directions', async (req, res) => {
   }
 });
 
+// =================
+// MAPS TRAJETS — Calcul itinéraires
+// =================
+
+const DEFAULT_ORIGIN = '10 rue Etienne Bacquié, Toulouse, France';
+
+app.post('/maps/trajet', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ success: false, error: 'Google Maps API key not configured' });
+  
+  try {
+    const { origin, destination, arrivalTime, mode = 'transit', prepMinutes = 10 } = req.body;
+    if (!destination) return res.status(400).json({ success: false, error: 'destination required' });
+    
+    const from = origin || DEFAULT_ORIGIN;
+    const params = new URLSearchParams({
+      origin: from,
+      destination,
+      mode: mode === 'transit' ? 'transit' : mode,
+      key: apiKey
+    });
+    
+    // Si heure d'arrivée fournie, utiliser arrival_time
+    if (arrivalTime) {
+      const arrivalDate = new Date(arrivalTime);
+      const epochSec = Math.floor(arrivalDate.getTime() / 1000) - prepMinutes * 60;
+      params.set('arrival_time', epochSec);
+    }
+    
+    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`);
+    const data = await r.json();
+    
+    if (data.status !== 'OK' || !data.routes?.length) {
+      return res.json({ success: false, error: data.status || 'Aucun itinéraire trouvé' });
+    }
+    
+    const route = data.routes[0];
+    const leg = route.legs[0];
+    
+    // Extraire les étapes de transport en commun
+    const transitSteps = leg.steps.filter(s => s.travel_mode === 'TRANSIT').map(s => ({
+      line: s.transit_details?.line?.short_name || s.transit_details?.line?.name || '',
+      vehicle: s.transit_details?.line?.vehicle?.type || '',
+      departure: s.transit_details?.departure_stop?.name || '',
+      arrival: s.transit_details?.arrival_stop?.name || '',
+      duration: s.duration?.text || ''
+    }));
+    
+    // Calculer heure de départ
+    const departMs = leg.departure_time?.value ? leg.departure_time.value * 1000 : null;
+    const departText = departMs ? new Date(departMs).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null;
+    
+    // Calculer rappel (notification)
+    let rappel = null;
+    if (departMs && arrivalTime) {
+      const now = Date.now();
+      const minBefore = Math.floor((departMs - now) / 60000);
+      rappel = {
+        departureTime: new Date(departMs).toISOString(),
+        departureText: departText,
+        minutesUntilDeparture: minBefore,
+        message: minBefore <= 0 ? 'Tu devrais être parti !' : `Partir à ${departText} (dans ${minBefore} min)`
+      };
+    }
+    
+    res.json({
+      success: true,
+      trajet: {
+        distance: leg.distance?.text || '',
+        duration: leg.duration?.text || '',
+        departureTime: departText,
+        steps: transitSteps
+      },
+      rappel
+    });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/maps/trajets-agenda', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ success: false, error: 'Google Maps API key not configured' });
+  
+  try {
+    const { events, prepMinutes = 10 } = req.body;
+    if (!Array.isArray(events)) return res.status(400).json({ success: false, error: 'events[] required' });
+    
+    const trajets = await Promise.allSettled(events.map(async (evt) => {
+      if (!evt.location) return { eventId: evt.id, success: false, error: 'Pas de lieu' };
+      
+      const params = new URLSearchParams({
+        origin: DEFAULT_ORIGIN,
+        destination: evt.location,
+        mode: 'transit',
+        key: apiKey
+      });
+      
+      if (evt.startTime || evt.start) {
+        const arrivalDate = new Date(evt.startTime || evt.start);
+        const epochSec = Math.floor(arrivalDate.getTime() / 1000) - prepMinutes * 60;
+        params.set('arrival_time', epochSec);
+      }
+      
+      const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params}`);
+      const data = await r.json();
+      
+      if (data.status !== 'OK' || !data.routes?.length) {
+        return { eventId: evt.id, success: false, error: data.status };
+      }
+      
+      const leg = data.routes[0].legs[0];
+      const departMs = leg.departure_time?.value ? leg.departure_time.value * 1000 : null;
+      
+      return {
+        eventId: evt.id,
+        success: true,
+        trajet: {
+          distance: leg.distance?.text || '',
+          duration: leg.duration?.text || '',
+          departureTime: departMs ? new Date(departMs).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null
+        }
+      };
+    }));
+    
+    res.json({
+      success: true,
+      trajets: trajets.filter(r => r.status === 'fulfilled').map(r => r.value)
+    });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
 // RSS Proxy (for podcast fallback)
 app.post('/proxy/rss', async (req, res) => {
   try {
