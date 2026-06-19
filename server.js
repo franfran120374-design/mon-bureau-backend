@@ -399,6 +399,75 @@ app.post('/proxy/rss', async (req, res) => {
 });
 
 // =================
+// WEB PUSH — Notifications
+// =================
+
+const PUSH_SUBSCRIPTIONS = []; // En prod: utiliser une DB
+
+app.post('/push/subscribe', (req, res) => {
+  const subscription = req.body;
+  if (!subscription?.endpoint) return res.status(400).json({ error: 'Subscription required' });
+  
+  // Éviter les doublons
+  const exists = PUSH_SUBSCRIPTIONS.find(s => s.endpoint === subscription.endpoint);
+  if (!exists) PUSH_SUBSCRIPTIONS.push(subscription);
+  
+  console.log(`[Push] Nouvel abonnement (${PUSH_SUBSCRIPTIONS.length} total)`);
+  res.json({ success: true, count: PUSH_SUBSCRIPTIONS.length });
+});
+
+app.post('/push/unsubscribe', (req, res) => {
+  const { endpoint } = req.body;
+  const idx = PUSH_SUBSCRIPTIONS.findIndex(s => s.endpoint === endpoint);
+  if (idx !== -1) PUSH_SUBSCRIPTIONS.splice(idx, 1);
+  res.json({ success: true });
+});
+
+app.post('/push/send', async (req, res) => {
+  const { title, body, url } = req.body;
+  const privateKey = process.env.VAPID_PRIVATE_KEY;
+  
+  if (!privateKey) {
+    return res.status(503).json({ error: 'VAPID_PRIVATE_KEY not configured' });
+  }
+  
+  if (!PUSH_SUBSCRIPTIONS.length) {
+    return res.json({ success: true, sent: 0, message: 'No subscribers' });
+  }
+  
+  // Import dynamique de web-push
+  let webpush;
+  try {
+    webpush = await import('web-push');
+    webpush.default.setVapidDetails(
+      'mailto:mon-bureau@example.com',
+      'BMMP3lc0SYLpcwMTvK4wt0a7ru3bAe67uVZK3AmS3yXmZ79k1e-i6DNt9BGZiuUwnOkyKkOZpRB63_Oh58U9SaE',
+      privateKey
+    );
+  } catch(e) {
+    return res.status(503).json({ error: 'web-push module not installed' });
+  }
+  
+  const payload = JSON.stringify({ title: title || 'Mon Bureau', body: body || '', url: url || '/' });
+  let sent = 0;
+  
+  for (const sub of PUSH_SUBSCRIPTIONS) {
+    try {
+      await webpush.default.sendNotification(sub, payload);
+      sent++;
+    } catch(e) {
+      if (e.statusCode === 410) {
+        // Abonnement expiré, le supprimer
+        const idx = PUSH_SUBSCRIPTIONS.findIndex(s => s.endpoint === sub.endpoint);
+        if (idx !== -1) PUSH_SUBSCRIPTIONS.splice(idx, 1);
+      }
+    }
+  }
+  
+  res.json({ success: true, sent, total: PUSH_SUBSCRIPTIONS.length });
+});
+
+// =================
 // AGENTS IA (proxy Anthropic)
 // =================
 
