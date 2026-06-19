@@ -399,6 +399,112 @@ app.post('/proxy/rss', async (req, res) => {
 });
 
 // =================
+// MÉTÉO — Open-Meteo (gratuit, sans clé API)
+// Toulouse: 43.6047°N, 1.4442°E
+// =================
+
+const METEO_LAT = 43.6047;
+const METEO_LON = 1.4442;
+
+app.get('/meteo/actuelle', async (req, res) => {
+  try {
+    const params = new URLSearchParams({
+      latitude: METEO_LAT, longitude: METEO_LON,
+      current: 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,uv_index',
+      timezone: 'Europe/Paris'
+    });
+    const r = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal: AbortSignal.timeout(8000) });
+    const data = await r.json();
+    res.json({ success: true, data: { current_weather: data.current } });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.get('/meteo/heure', async (req, res) => {
+  try {
+    const { datetime } = req.query;
+    const params = new URLSearchParams({
+      latitude: METEO_LAT, longitude: METEO_LON,
+      hourly: 'temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m,uv_index',
+      timezone: 'Europe/Paris',
+      forecast_days: 2
+    });
+    const r = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal: AbortSignal.timeout(8000) });
+    const data = await r.json();
+    
+    // Trouver l'heure la plus proche
+    const target = datetime ? new Date(datetime) : new Date();
+    const hours = data.hourly?.time || [];
+    let closestIdx = 0;
+    let minDiff = Infinity;
+    hours.forEach((h, i) => {
+      const diff = Math.abs(new Date(h) - target);
+      if (diff < minDiff) { minDiff = diff; closestIdx = i; }
+    });
+    
+    const meteo = {
+      temperature: data.hourly?.temperature_2m?.[closestIdx],
+      apparentTemp: data.hourly?.apparent_temperature?.[closestIdx],
+      precipProb: data.hourly?.precipitation_probability?.[closestIdx],
+      precip: data.hourly?.precipitation?.[closestIdx],
+      weatherCode: data.hourly?.weather_code?.[closestIdx],
+      windspeed: data.hourly?.wind_speed_10m?.[closestIdx],
+      uvIndex: data.hourly?.uv_index?.[closestIdx]
+    };
+    
+    res.json({ success: true, meteo });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/meteo/conseils-rdv', async (req, res) => {
+  try {
+    const { datetime } = req.body;
+    const params = new URLSearchParams({
+      latitude: METEO_LAT, longitude: METEO_LON,
+      hourly: 'temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m,uv_index',
+      timezone: 'Europe/Paris',
+      forecast_days: 2
+    });
+    const r = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal: AbortSignal.timeout(8000) });
+    const data = await r.json();
+    
+    const target = datetime ? new Date(datetime) : new Date();
+    const hours = data.hourly?.time || [];
+    let closestIdx = 0;
+    let minDiff = Infinity;
+    hours.forEach((h, i) => {
+      const diff = Math.abs(new Date(h) - target);
+      if (diff < minDiff) { minDiff = diff; closestIdx = i; }
+    });
+    
+    const m = {
+      temp: data.hourly?.temperature_2m?.[closestIdx],
+      feelsLike: data.hourly?.apparent_temperature?.[closestIdx],
+      precipProb: data.hourly?.precipitation_probability?.[closestIdx],
+      precip: data.hourly?.precipitation?.[closestIdx],
+      weatherCode: data.hourly?.weather_code?.[closestIdx],
+      windspeed: data.hourly?.wind_speed_10m?.[closestIdx],
+      uvIndex: data.hourly?.uv_index?.[closestIdx]
+    };
+    
+    const conseils = [];
+    if (m.precipProb > 50) conseils.push('Prévois un parapluie');
+    if (m.temp < 5) conseils.push('Habille-toi chaudement');
+    if (m.temp > 30) conseils.push('Reste à l\'ombre si possible');
+    if (m.windspeed > 30) conseils.push('Vent fort prévu');
+    if (m.uvIndex > 6) conseils.push('Crème solaire recommandée');
+    if (conseils.length === 0) conseils.push('Belle conditions pour ce rendez-vous');
+    
+    res.json({ success: true, meteo: m, conseils });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// =================
 // WEB PUSH — Notifications
 // =================
 
