@@ -67,44 +67,14 @@ app.get('/auth/google/callback', async (req, res) => {
       addedAt: Date.now()
     };
 
-    const frontendUrl = state || '/';
-
-    res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Connexion réussie</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 40px; text-align: center; background: #f5f5f5; }
-    .card { background: white; padding: 30px; border-radius: 12px; max-width: 400px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    h1 { color: #22c55e; margin: 0 0 10px; }
-    p { color: #666; }
-    img { width: 60px; height: 60px; border-radius: 50%; margin: 10px 0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>✓ Connecté</h1>
-    ${data.picture ? `<img src="${data.picture}" alt="">` : ''}
-    <h2>${data.name || data.email}</h2>
-    <p>${data.email}</p>
-    <p style="margin-top:20px; font-size:14px">Cette fenêtre va se fermer...</p>
-  </div>
-  <script>
-    const accountData = ${JSON.stringify(accountData)};
-    if (window.opener) {
-      try { window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', account: accountData }, '*'); } catch(e) {}
-    }
-    try { localStorage.setItem('pendingGoogleAuth', JSON.stringify(accountData)); } catch(e) {}
-    setTimeout(() => {
-      window.close();
-      if (!window.closed) {
-        document.body.innerHTML = '<div class="card"><h1>✓ Connexion OK</h1><p>Tu peux fermer cette fenêtre et retourner à l\\'app.</p></div>';
-      }
-    }, 1500);
-  </script>
-</body>
-</html>`);
+    const frontendUrl = state || 'https://franfran120374-design.github.io/mon-bureau/';
+    
+    // Encoder les données en base64 pour passer dans l'URL
+    const encoded = Buffer.from(JSON.stringify(accountData)).toString('base64');
+    
+    // Rediriger vers le frontend avec les données dans le hash
+    const redirectUrl = `${frontendUrl}#google_auth=${encoded}`;
+    res.redirect(redirectUrl);
   } catch (error) {
     console.error('Auth error:', error);
     res.send(`<h1>Erreur</h1><pre>${error.message}</pre>`);
