@@ -543,12 +543,13 @@ const METEO_LON = 1.4442;
 app.get('/meteo/actuelle', async (req, res) => {
   try {
     const params = new URLSearchParams({
-      latitude: METEO_LAT, longitude: METEO_LON,
+      latitude: String(METEO_LAT), longitude: String(METEO_LON),
       current: 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,uv_index',
       timezone: 'Europe/Paris'
     });
     const r = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal: AbortSignal.timeout(8000) });
     const data = await r.json();
+    if (!data.current) return res.json({ success: false, error: 'No current data', raw: data });
     res.json({ success: true, data: { current_weather: data.current } });
   } catch (e) {
     res.json({ success: false, error: e.message });
@@ -559,10 +560,10 @@ app.get('/meteo/heure', async (req, res) => {
   try {
     const { datetime } = req.query;
     const params = new URLSearchParams({
-      latitude: METEO_LAT, longitude: METEO_LON,
+      latitude: String(METEO_LAT), longitude: String(METEO_LON),
       hourly: 'temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m,uv_index',
       timezone: 'Europe/Paris',
-      forecast_days: 2
+      forecast_days: '2'
     });
     const r = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal: AbortSignal.timeout(8000) });
     const data = await r.json();
@@ -597,7 +598,7 @@ app.post('/meteo/conseils-rdv', async (req, res) => {
   try {
     const { datetime } = req.body;
     const params = new URLSearchParams({
-      latitude: METEO_LAT, longitude: METEO_LON,
+      latitude: String(METEO_LAT), longitude: String(METEO_LON),
       hourly: 'temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m,uv_index',
       timezone: 'Europe/Paris',
       forecast_days: 2
