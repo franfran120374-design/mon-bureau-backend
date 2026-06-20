@@ -713,11 +713,52 @@ app.post('/agents/chat', async (req, res) => {
 });
 
 // =================
+// VÉLO — VélôToulouse (API GBFS gratuite)
+// =================
+
+app.get('/velo/stations', async (req, res) => {
+  try {
+    const { lat = 43.6047, lon = 1.4442, nb = 5 } = req.query;
+    
+    // API GBFS VélôToulouse
+    const r = await fetch('https://data.toulouse-metropole.fr/api/explore/v2.1/catalog/datasets/velo-toulouse/records?limit=100', {
+      signal: AbortSignal.timeout(8000)
+    });
+    const data = await r.json();
+    
+    // Calculer distance à chaque station
+    const stations = (data.results || []).map(s => {
+      const sLat = s.lat || s.coordonnees?.lat;
+      const sLon = s.lon || s.coordonnees?.lon;
+      if (!sLat || !sLon) return null;
+      
+      const dist = Math.sqrt(Math.pow((lat - sLat) * 111, 2) + Math.pow((lon - sLon) * 111 * Math.cos(lat * Math.PI / 180), 2));
+      
+      return {
+        name: s.nom || s.name || 'Station',
+        bikes: s.nb_velos_disponibles || s.available_bikes || 0,
+        docks: s.nb_places_disponibles || s.available_docks || 0,
+        lat: sLat,
+        lon: sLon,
+        distance: Math.round(dist * 1000)
+      };
+    }).filter(Boolean);
+    
+    // Trier par distance et prendre les plus proches
+    stations.sort((a, b) => a.distance - b.distance);
+    
+    res.json({ success: true, stations: stations.slice(0, parseInt(nb)) });
+  } catch (e) {
+    res.json({ success: false, error: e.message, stations: [] });
+  }
+});
+
+// =================
 // HEALTH
 // =================
 
 app.get('/', (req, res) => {
-  res.json({ name: 'Mon Bureau Backend', version: '2.1.0', status: 'ok' });
+  res.json({ name: 'Mon Bureau Backend', version: '2.2.0', status: 'ok' });
 });
 
 app.get('/health', (req, res) => {
