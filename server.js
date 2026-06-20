@@ -14,14 +14,23 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Web Push VAPID
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BMMP3lc0SYLpcwMTvK4wt0a7ru3bAe67uVZK3AmS3yXmZ79k1e-i6DNt9BGZiuUwnOkyKkOZpRB63_Oh58U9SaE';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BMDXlVypI88MrD_UToYt6OIFORyaxAB50UsC1VbE_OF5gQ6BQGed77ETAhLAKQoQQWIVqUzNHNxTQtux_YoYF4Q';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '4rEsQzB9QzMH_7cmcgTRN8Dd54FF3OO2jJ1NDdLX1sg';
+let pushEnabled = false;
 if (VAPID_PRIVATE_KEY) {
-  webPush.setVapidDetails(
-    'mailto:mon-bureau@example.com',
-    VAPID_PUBLIC_KEY,
-    VAPID_PRIVATE_KEY
-  );
+  try {
+    webPush.setVapidDetails(
+      'mailto:mon-bureau@example.com',
+      VAPID_PUBLIC_KEY,
+      VAPID_PRIVATE_KEY
+    );
+    pushEnabled = true;
+    console.log('[Push] ✅ VAPID configuré');
+  } catch (e) {
+    console.warn('[Push] ⚠️ VAPID invalide — push désactivé:', e.message);
+  }
+} else {
+  console.log('[Push] ⚠️ Pas de VAPID_PRIVATE_KEY — push désactivé');
 }
 
 // Store des subscriptions push (en mémoire — en prod, utiliser une DB)
@@ -738,7 +747,7 @@ app.post('/push/unsubscribe', (req, res) => {
 
 app.post('/push/send', async (req, res) => {
   try {
-    if (!VAPID_PRIVATE_KEY) return res.status(503).json({ error: 'VAPID_PRIVATE_KEY not configured' });
+    if (!pushEnabled) return res.status(503).json({ error: 'Push notifications not configured (VAPID key invalid)' });
     const { title, body, url } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
 
