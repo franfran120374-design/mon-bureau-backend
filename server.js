@@ -193,13 +193,93 @@ function getAuthClient(tokens) {
 function getTokensFromRequest(req) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) {
-    throw new Error('Header Authorization manquant');
+    const e = new Error('Header Authorization manquant');
+    e.statusCode = 401;
+    throw e;
   }
   const encoded = auth.substring(7);
   try {
     return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
   } catch (e) {
-    throw new Error('Tokens invalides');
+    const err = new Error('Tokens invalides');
+    err.statusCode = 401;
+    throw err;
+  }
+}
+
+// =================
+// Helper: force un vrai refresh du token via l'endpoint OAuth2 de Google
+// (indépendant du mécanisme interne de la lib, qui se base sur expiry_date —
+// utile quand expiry_date est faux/absent et que Google renvoie un 401 direct)
+// =================
+async function forceRefreshToken(refresh_token) {
+  const params = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+    refresh_token,
+    grant_type: 'refresh_token'
+  });
+  const r = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    // ex: invalid_grant => refresh_token lui-même mort (révoqué/expiré côté Google)
+    throw new Error(data.error_description || data.error || 'Refresh token invalide');
+  }
+  return {
+    access_token: data.access_token,
+    expiry_date: Date.now() + (data.expires_in * 1000),
+    scope: data.scope,
+    token_type: data.token_type,
+    refresh_token // Google n'en renvoie généralement pas un nouveau, on garde l'original
+  };
+}
+
+// =================
+// Helper: exécute un appel Google API, et si Google répond 401
+// (credentials invalides malgré expiry_date), force un refresh réel et réessaie UNE fois.
+// Centralise la logique pour toutes les routes Calendar/Drive au lieu de la dupliquer.
+// =================
+async function withGoogleAuth(tokens, apiCallFn) {
+  let currentTokens = tokens;
+  let auth = getAuthClient(currentTokens);
+
+  const isAuthError = (error) => {
+    const status = error?.code || error?.response?.status;
+    return status === 401 || status === '401';
+  };
+
+  try {
+    const result = await apiCallFn(auth);
+    return { result, tokens: auth.credentials };
+  } catch (error) {
+    if (isAuthError(error) && currentTokens.refresh_token) {
+      const refreshed = await forceRefreshToken(currentTokens.refresh_token).catch((refreshErr) => {
+        const e = new Error('Session Google expirée — reconnexion nécessaire');
+        e.statusCode = 401;
+        e.cause = refreshErr.message;
+        throw e;
+      });
+      currentTokens = { ...currentTokens, ...refreshed };
+      auth = getAuthClient(currentTokens);
+      try {
+        const result = await apiCallFn(auth);
+        return { result, tokens: auth.credentials };
+      } catch (retryError) {
+        const e = new Error('Session Google expirée — reconnexion nécessaire');
+        e.statusCode = 401;
+        throw e;
+      }
+    }
+    if (isAuthError(error)) {
+      const e = new Error('Session Google expirée — reconnexion nécessaire (pas de refresh token disponible)');
+      e.statusCode = 401;
+      throw e;
+    }
+    throw error;
   }
 }
 
@@ -210,90 +290,91 @@ function getTokensFromRequest(req) {
 app.get('/calendar/events', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const calendar = google.calendar({ version: 'v3', auth });
-    
-    const response = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: req.query.timeMin || new Date().toISOString(),
-      maxResults: parseInt(req.query.maxResults) || 50,
-      singleEvents: true,
-      orderBy: 'startTime'
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const calendar = google.calendar({ version: 'v3', auth });
+      const response = await calendar.events.list({
+        calendarId: 'primary',
+        timeMin: req.query.timeMin || new Date().toISOString(),
+        maxResults: parseInt(req.query.maxResults) || 50,
+        singleEvents: true,
+        orderBy: 'startTime'
+      });
+      return response.data.items;
     });
-    
-    // Renvoie aussi les tokens mis à jour si refresh
-    const newTokens = auth.credentials;
-    res.json({ 
-      events: response.data.items,
+
+    res.json({
+      events: result,
       tokens: newTokens // Le frontend met à jour son localStorage
     });
   } catch (error) {
-    console.error('Calendar list error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Calendar] list error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.post('/calendar/events', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const calendar = google.calendar({ version: 'v3', auth });
-    
-    const event = await calendar.events.insert({
-      calendarId: 'primary',
-      resource: req.body
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const calendar = google.calendar({ version: 'v3', auth });
+      const event = await calendar.events.insert({
+        calendarId: 'primary',
+        resource: req.body
+      });
+      return event.data;
     });
-    
-    res.json({ 
-      event: event.data,
-      tokens: auth.credentials
+
+    res.json({
+      event: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Calendar create error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Calendar] create error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.delete('/calendar/events/:eventId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const calendar = google.calendar({ version: 'v3', auth });
-    
-    await calendar.events.delete({
-      calendarId: 'primary',
-      eventId: req.params.eventId
+    const { tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const calendar = google.calendar({ version: 'v3', auth });
+      await calendar.events.delete({
+        calendarId: 'primary',
+        eventId: req.params.eventId
+      });
     });
-    
-    res.json({ 
+
+    res.json({
       success: true,
-      tokens: auth.credentials
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Calendar delete error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Calendar] delete error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.patch('/calendar/events/:eventId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const calendar = google.calendar({ version: 'v3', auth });
-    
-    const event = await calendar.events.patch({
-      calendarId: 'primary',
-      eventId: req.params.eventId,
-      resource: req.body
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const calendar = google.calendar({ version: 'v3', auth });
+      const event = await calendar.events.patch({
+        calendarId: 'primary',
+        eventId: req.params.eventId,
+        requestBody: req.body
+      });
+      return event.data;
     });
-    
-    res.json({ 
-      event: event.data,
-      tokens: auth.credentials
+
+    res.json({
+      event: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Calendar update error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Calendar] update error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -304,115 +385,120 @@ app.patch('/calendar/events/:eventId', async (req, res) => {
 app.get('/drive/files', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    
-    const response = await drive.files.list({
-      pageSize: parseInt(req.query.pageSize) || 20,
-      fields: 'files(id, name, mimeType, modifiedTime, size, webViewLink)',
-      q: req.query.query || "trashed=false",
-      orderBy: 'modifiedTime desc'
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const drive = google.drive({ version: 'v3', auth });
+      const response = await drive.files.list({
+        pageSize: parseInt(req.query.pageSize) || 20,
+        fields: 'files(id, name, mimeType, modifiedTime, size, webViewLink)',
+        q: req.query.query || "trashed=false",
+        orderBy: 'modifiedTime desc'
+      });
+      return response.data.files;
     });
-    
-    res.json({ 
-      files: response.data.files,
-      tokens: auth.credentials
+
+    res.json({
+      files: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Drive list error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Drive] list error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.get('/drive/search', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    
-    const response = await drive.files.list({
-      pageSize: 20,
-      fields: 'files(id, name, mimeType, modifiedTime, webViewLink)',
-      q: `name contains '${req.query.q}' and trashed=false`
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const drive = google.drive({ version: 'v3', auth });
+      const response = await drive.files.list({
+        pageSize: 20,
+        fields: 'files(id, name, mimeType, modifiedTime, webViewLink)',
+        q: `name contains '${req.query.q}' and trashed=false`
+      });
+      return response.data.files;
     });
-    
-    res.json({ 
-      files: response.data.files,
-      tokens: auth.credentials
+
+    res.json({
+      files: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Drive search error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Drive] search error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.post('/drive/upload', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    
-    const file = await drive.files.create({
-      resource: { name: req.body.fileName },
-      media: { 
-        mimeType: req.body.mimeType || 'text/plain', 
-        body: req.body.content 
-      },
-      fields: 'id, name, webViewLink'
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const drive = google.drive({ version: 'v3', auth });
+      const file = await drive.files.create({
+        resource: { name: req.body.fileName },
+        media: {
+          mimeType: req.body.mimeType || 'text/plain',
+          body: req.body.content
+        },
+        fields: 'id, name, webViewLink'
+      });
+      return file.data;
     });
-    
-    res.json({ 
-      file: file.data,
-      tokens: auth.credentials
+
+    res.json({
+      file: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Drive upload error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Drive] upload error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.get('/drive/download/:fileId', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    
-    const response = await drive.files.get({
-      fileId: req.params.fileId,
-      alt: 'media'
-    }, { responseType: 'arraybuffer' });
-    
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const drive = google.drive({ version: 'v3', auth });
+      const response = await drive.files.get({
+        fileId: req.params.fileId,
+        alt: 'media'
+      }, { responseType: 'arraybuffer' });
+      return Buffer.from(response.data).toString('base64');
+    });
+
     res.json({
-      content: Buffer.from(response.data).toString('base64'),
-      tokens: auth.credentials
+      content: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Drive download error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Drive] download error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.post('/drive/create-folder', async (req, res) => {
   try {
     const tokens = getTokensFromRequest(req);
-    const auth = getAuthClient(tokens);
-    const drive = google.drive({ version: 'v3', auth });
-    
-    const folder = await drive.files.create({
-      resource: {
-        name: req.body.folderName,
-        mimeType: 'application/vnd.google-apps.folder'
-      },
-      fields: 'id, name, webViewLink'
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const drive = google.drive({ version: 'v3', auth });
+      const folder = await drive.files.create({
+        resource: {
+          name: req.body.folderName,
+          mimeType: 'application/vnd.google-apps.folder'
+        },
+        fields: 'id, name, webViewLink'
+      });
+      return folder.data;
     });
-    
+
     res.json({
-      folder: folder.data,
-      tokens: auth.credentials
+      folder: result,
+      tokens: newTokens
     });
   } catch (error) {
-    console.error('Drive create folder error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Drive] create folder error:', error.message);
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
