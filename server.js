@@ -13,11 +13,12 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Web Push VAPID
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BMDXlVypI88MrD_UToYt6OIFORyaxAB50UsC1VbE_OF5gQ6BQGed77ETAhLAKQoQQWIVqUzNHNxTQtux_YoYF4Q';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '4rEsQzB9QzMH_7cmcgTRN8Dd54FF3OO2jJ1NDdLX1sg';
+// Web Push VAPID — uniquement via variables d'environnement Render
+// (pas de fallback en dur : le repo est public, une clé privée ne doit jamais s'y trouver)
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 let pushEnabled = false;
-if (VAPID_PRIVATE_KEY) {
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   try {
     webPush.setVapidDetails(
       'mailto:mon-bureau@example.com',
@@ -30,8 +31,9 @@ if (VAPID_PRIVATE_KEY) {
     console.warn('[Push] ⚠️ VAPID invalide — push désactivé:', e.message);
   }
 } else {
-  console.log('[Push] ⚠️ Pas de VAPID_PRIVATE_KEY — push désactivé');
+  console.log('[Push] ⚠️ VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY absentes des variables d\'environnement — push désactivé');
 }
+
 
 // Store des subscriptions push (en mémoire — en prod, utiliser une DB)
 const pushSubscriptions = [];
