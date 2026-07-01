@@ -536,9 +536,12 @@ URL : ${url || 'N/A'}
 Contenu : ${String(content || '').substring(0, 4000)}`;
 }
 
-app.post('/fiche/create', async (req, res) => {
+// Étape 1/2 : génère le contenu de la fiche (résumé + fact-check + tags) SANS l'enregistrer.
+// Ne nécessite pas d'auth Google — juste l'agrégateur IA. L'utilisateur relit/édite
+// avant de valider l'enregistrement via /fiche/save.
+app.post('/fiche/preview', async (req, res) => {
   try {
-    const { title, content, url, sourceDate, folderId } = req.body;
+    const { title, content, url, sourceDate } = req.body;
     if (!content && !title) return res.status(400).json({ error: 'content ou title requis' });
 
     const prompt = buildFichePrompt(title, content, url);
@@ -554,6 +557,26 @@ app.post('/fiche/create', async (req, res) => {
 
 ${analyse}
 `;
+
+    res.json({
+      success: true,
+      title: title || 'Fiche sans titre',
+      ficheContent,
+      provider: aggregatorResult.provider,
+      model: aggregatorResult.model
+    });
+  } catch (error) {
+    console.error('[Fiche] preview error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Étape 2/2 : enregistre le contenu (potentiellement édité par l'utilisateur) sur
+// Drive en Google Doc natif. Appelée uniquement après validation explicite.
+app.post('/fiche/save', async (req, res) => {
+  try {
+    const { title, ficheContent, folderId } = req.body;
+    if (!ficheContent) return res.status(400).json({ error: 'ficheContent requis' });
 
     const tokens = getTokensFromRequest(req);
     const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
@@ -571,15 +594,9 @@ ${analyse}
       return file.data;
     });
 
-    res.json({
-      success: true,
-      file: result,
-      tokens: newTokens,
-      ficheContent,
-      model: aggregatorResult.model
-    });
+    res.json({ success: true, file: result, tokens: newTokens });
   } catch (error) {
-    console.error('[Fiche] create error:', error.message);
+    console.error('[Fiche] save error:', error.message);
     res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
@@ -690,7 +707,7 @@ app.post('/claude/summarize', async (req, res) => {
     if (!text) return res.status(400).json({ error: 'text required' });
     const prompt = `Résume ce texte en 3-5 phrases claires et concises, en français. Type: ${type || 'article'}.\n\n${String(text).substring(0, 4000)}`;
     const data = await callAggregator(prompt, 'contexte_long');
-    res.json({ success: true, summary: data.response || '' });
+    res.json({ success: true, summary: data.response || '', provider: data.provider, model: data.model });
   } catch (error) {
     console.error('[Aggregator] summarize error:', error.message);
     res.status(500).json({ success: false, error: error.message });
@@ -705,7 +722,7 @@ app.post('/claude/factcheck', async (req, res) => {
     if (!content && !title) return res.status(400).json({ error: 'content required' });
     const prompt = `Tu es un fact-checker. Vérifie l'affirmation ou l'article suivant et réponds en français, de façon structurée avec : verdict (Vrai/Faux/Non vérifiable/Partiellement vrai), confiance (%), contexte (2-3 phrases).\n\nTitre: ${title || 'N/A'}\nContenu: ${String(content || '').substring(0, 4000)}\nURL: ${url || 'N/A'}`;
     const data = await callAggregator(prompt, 'raisonnement');
-    res.json({ success: true, result: data.response || '' });
+    res.json({ success: true, result: data.response || '', provider: data.provider, model: data.model });
   } catch (error) {
     console.error('[Aggregator] factcheck error:', error.message);
     res.status(500).json({ success: false, error: error.message });
@@ -720,7 +737,7 @@ app.post('/claude/factcheck-deep', async (req, res) => {
     if (!content && !title) return res.status(400).json({ error: 'content required' });
     const system = `Tu es un fact-checker expert. Vérifie l'affirmation ou l'article suivant. Indique si c'est vraisemblable, faux, ou non vérifiable. Donne une réponse structurée avec: verdict (Vrai/Faux/Non vérifiable), confiance (%), sources suggérées, contexte. Réponds en français.`;
     const data = await callClaude([{ role: 'user', content: `Titre: ${title || 'N/A'}\nContenu: ${content}\nURL: ${url || 'N/A'}` }], system, 1024);
-    res.json({ success: true, result: data.content[0]?.text || '' });
+    res.json({ success: true, result: data.content[0]?.text || '', provider: 'anthropic', model: data.model || 'claude-sonnet-4-20250514' });
   } catch (error) {
     console.error('[Claude] factcheck-deep error:', error.message);
     res.status(500).json({ success: false, error: error.message });
