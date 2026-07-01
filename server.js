@@ -436,8 +436,15 @@ app.post('/drive/upload', async (req, res) => {
     const tokens = getTokensFromRequest(req);
     const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
       const drive = google.drive({ version: 'v3', auth });
+      // Comportement historique inchangé (fileName/content/mimeType = type du média source).
+      // Deux champs additifs optionnels, jamais envoyés par les appelants existants :
+      // - folderId : range le fichier dans un dossier au lieu de la racine
+      // - targetMimeType : convertit à l'upload en type natif Drive (ex: Google Doc)
+      const resource = { name: req.body.fileName };
+      if (req.body.folderId) resource.parents = [req.body.folderId];
+      if (req.body.targetMimeType) resource.mimeType = req.body.targetMimeType;
       const file = await drive.files.create({
-        resource: { name: req.body.fileName },
+        resource,
         media: {
           mimeType: req.body.mimeType || 'text/plain',
           body: req.body.content
@@ -505,6 +512,79 @@ app.post('/drive/create-folder', async (req, res) => {
 });
 
 // =================
+// FICHE — synthèse d'un article (résumé + fact-check + tags) sauvegardée sur Drive
+// en Google Doc natif. Utilise l'agrégateur IA gratuit (voir callAggregator plus bas).
+// =================
+
+function buildFichePrompt(title, content, url) {
+  return `Tu analyses un article pour en faire une fiche de synthèse. Réponds STRICTEMENT dans ce format markdown, sans rien ajouter avant ou après :
+
+## Résumé
+(3 à 5 phrases résumant les points essentiels de l'article)
+
+## Vérification factuelle
+Verdict : (Vrai / Faux / Non vérifiable / Partiellement vrai)
+Confiance : (un pourcentage)
+Justification : (2-3 phrases expliquant le verdict)
+
+## Mots-clés
+(3 à 6 mots-clés séparés par des virgules, en minuscules)
+
+---
+Titre de l'article : ${title || 'N/A'}
+URL : ${url || 'N/A'}
+Contenu : ${String(content || '').substring(0, 4000)}`;
+}
+
+app.post('/fiche/create', async (req, res) => {
+  try {
+    const { title, content, url, sourceDate, folderId } = req.body;
+    if (!content && !title) return res.status(400).json({ error: 'content ou title requis' });
+
+    const prompt = buildFichePrompt(title, content, url);
+    const aggregatorResult = await callAggregator(prompt, 'raisonnement');
+    const analyse = aggregatorResult.response || '';
+
+    const now = new Date().toISOString().slice(0, 10);
+    const ficheContent = `# ${title || 'Fiche sans titre'}
+
+**Source :** ${url || 'N/A'}
+**Date de l'article :** ${sourceDate || 'inconnue'}
+**Fiche créée le :** ${now}
+
+${analyse}
+`;
+
+    const tokens = getTokensFromRequest(req);
+    const { result, tokens: newTokens } = await withGoogleAuth(tokens, async (auth) => {
+      const drive = google.drive({ version: 'v3', auth });
+      const resource = {
+        name: `Fiche - ${(title || 'sans titre').substring(0, 80)}`,
+        mimeType: 'application/vnd.google-apps.document' // converti en Google Doc natif
+      };
+      if (folderId) resource.parents = [folderId];
+      const file = await drive.files.create({
+        resource,
+        media: { mimeType: 'text/plain', body: ficheContent },
+        fields: 'id, name, webViewLink'
+      });
+      return file.data;
+    });
+
+    res.json({
+      success: true,
+      file: result,
+      tokens: newTokens,
+      ficheContent,
+      model: aggregatorResult.model
+    });
+  } catch (error) {
+    console.error('[Fiche] create error:', error.message);
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+// =================
 // HEALTH
 // =================
 
@@ -549,6 +629,34 @@ async function callClaude(messages, system, maxTokens = 1024) {
   return await response.json();
 }
 
+// =================
+// AGRÉGATEUR IA (Groq/Gemini/OpenRouter gratuits) — voir repo ai-aggregator
+// Utilisé par défaut pour résumé/factcheck RSS (gratuit, rapide).
+// Claude reste disponible en option manuelle via /claude/factcheck-deep
+// et pour tout le reste de l'app (recettes, agents, etc.)
+// =================
+
+const AGGREGATOR_URL = process.env.AGGREGATOR_URL; // ex: https://ai-aggregator-78gp.onrender.com
+const AGGREGATOR_ACCESS_TOKEN = process.env.AGGREGATOR_ACCESS_TOKEN;
+
+async function callAggregator(prompt, category) {
+  if (!AGGREGATOR_URL) throw new Error('AGGREGATOR_URL non configurée');
+  const response = await fetch(`${AGGREGATOR_URL}/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(AGGREGATOR_ACCESS_TOKEN ? { 'X-Access-Token': AGGREGATOR_ACCESS_TOKEN } : {})
+    },
+    // Le service Render gratuit peut être en veille (cold start ~30-50s) : on laisse le temps
+    body: JSON.stringify({ prompt, category })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || `Agrégateur IA error: ${response.status}`);
+  }
+  return await response.json(); // { response, category, provider, model }
+}
+
 app.post('/agents/chat', async (req, res) => {
   try {
     const { messages, system } = req.body;
@@ -575,18 +683,38 @@ app.post('/claude/chat', async (req, res) => {
 });
 
 app.post('/claude/summarize', async (req, res) => {
+  // Nom de route conservé (compat frontend), mais passe désormais par l'agrégateur
+  // gratuit (Groq/Gemini/OpenRouter) au lieu de Claude payant.
   try {
     const { text, type } = req.body;
     if (!text) return res.status(400).json({ error: 'text required' });
-    const system = `Tu es un expert en résumé. Résume le texte suivant en 3-5 bullet points clairs et concis en français. Type: ${type || 'article'}.`;
-    const data = await callClaude([{ role: 'user', content: text }], system, 512);
-    res.json({ success: true, summary: data.content[0]?.text || '' });
+    const prompt = `Résume ce texte en 3-5 phrases claires et concises, en français. Type: ${type || 'article'}.\n\n${String(text).substring(0, 4000)}`;
+    const data = await callAggregator(prompt, 'contexte_long');
+    res.json({ success: true, summary: data.response || '' });
   } catch (error) {
+    console.error('[Aggregator] summarize error:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.post('/claude/factcheck', async (req, res) => {
+  // Nom de route conservé (compat frontend), mais passe désormais par l'agrégateur
+  // gratuit. Pour une vérification plus poussée (Claude), voir /claude/factcheck-deep.
+  try {
+    const { title, content, url } = req.body;
+    if (!content && !title) return res.status(400).json({ error: 'content required' });
+    const prompt = `Tu es un fact-checker. Vérifie l'affirmation ou l'article suivant et réponds en français, de façon structurée avec : verdict (Vrai/Faux/Non vérifiable/Partiellement vrai), confiance (%), contexte (2-3 phrases).\n\nTitre: ${title || 'N/A'}\nContenu: ${String(content || '').substring(0, 4000)}\nURL: ${url || 'N/A'}`;
+    const data = await callAggregator(prompt, 'raisonnement');
+    res.json({ success: true, result: data.response || '' });
+  } catch (error) {
+    console.error('[Aggregator] factcheck error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/claude/factcheck-deep', async (req, res) => {
+  // Vérification approfondie via Claude (payant), déclenchée manuellement uniquement
+  // (bouton "Analyse approfondie" dans l'app) — jamais appelée automatiquement.
   try {
     const { title, content, url } = req.body;
     if (!content && !title) return res.status(400).json({ error: 'content required' });
@@ -594,6 +722,7 @@ app.post('/claude/factcheck', async (req, res) => {
     const data = await callClaude([{ role: 'user', content: `Titre: ${title || 'N/A'}\nContenu: ${content}\nURL: ${url || 'N/A'}` }], system, 1024);
     res.json({ success: true, result: data.content[0]?.text || '' });
   } catch (error) {
+    console.error('[Claude] factcheck-deep error:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
