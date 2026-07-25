@@ -1376,7 +1376,8 @@ app.post('/maps/trajet', async (req, res) => {
 // trajet-module.js mais absente jusqu'ici : chaque badge échouait en silence.
 app.post('/maps/trajets-agenda', async (req, res) => {
   try {
-    const { events, prepMinutes } = req.body;
+    const { events, prepMinutes, origin } = req.body;
+    const departureOrigin = origin || DEFAULT_ORIGIN;
     if (!Array.isArray(events)) return res.status(400).json({ error: 'events[] required' });
     const trajets = [];
     for (const ev of events.slice(0, 8)) {
@@ -1384,7 +1385,7 @@ app.post('/maps/trajets-agenda', async (req, res) => {
       if (!destination) continue;
       const arrivalTime = ev.start || ev.startTime || ev.dateTime || ev.date || null;
       try {
-        const data = await computeRoute({ origin: DEFAULT_ORIGIN, destination, mode: ev.mode || 'transit', arrivalTime });
+        const data = await computeRoute({ origin: departureOrigin, destination, mode: ev.mode || 'transit', arrivalTime });
         const leg = data.routes[0].legs[0];
         const rappel = buildRappel(arrivalTime, leg.duration.value, prepMinutes);
         trajets.push({
@@ -1393,7 +1394,7 @@ app.post('/maps/trajets-agenda', async (req, res) => {
           duration: leg.duration.text,
           distance: leg.distance.text,
           steps: stepsForTrajetModule(leg.steps),
-          mapsLink: `https://www.google.com/maps/dir/${encodeURIComponent(DEFAULT_ORIGIN)}/${encodeURIComponent(destination)}`,
+          mapsLink: `https://www.google.com/maps/dir/${encodeURIComponent(departureOrigin)}/${encodeURIComponent(destination)}`,
           departureText: rappel?.departureText ?? null,
           minutesUntilDeparture: rappel?.minutesUntilDeparture ?? null,
           isUrgent: rappel?.isUrgent ?? false,
