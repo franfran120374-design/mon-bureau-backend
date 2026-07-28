@@ -1165,11 +1165,33 @@ const DEFAULT_ORIGIN = process.env.HOME_ADDRESS || '10 rue Etienne Bacquié, Tou
 
 const _geoCache = new Map(); // adresse → { lat, lon } (Nominatim limite à 1 req/s)
 
+// Les API publiques utilisées ici (Nominatim, OSRM openstreetmap.de, Transitous)
+// sont gratuites, mutualisées et sans SLA : elles échouent ou timeout par
+// intermittence sous charge. On absorbe ça avec 3 tentatives + court délai
+// avant de considérer que c'est une vraie panne.
+async function fetchWithRetry(url, options = {}, attempts = 3, delayMs = 600) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok && r.status >= 500 && i < attempts - 1) {
+        // Erreur serveur transitoire → on retente
+        throw new Error(`HTTP ${r.status}`);
+      }
+      return r;
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await new Promise(res => setTimeout(res, delayMs * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 async function geocode(address) {
   const key = String(address).trim().toLowerCase();
   if (_geoCache.has(key)) return _geoCache.get(key);
   const params = new URLSearchParams({ q: address, format: 'json', limit: '1' });
-  const r = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+  const r = await fetchWithRetry(`https://nominatim.openstreetmap.org/search?${params}`, {
     headers: { 'User-Agent': 'MonBureau/2.3 (app personnelle)' }
   });
   const data = await r.json();
@@ -1224,7 +1246,7 @@ const OSRM_PROFILES = {
 
 async function routeOsrm(mode, from, to) {
   const profile = OSRM_PROFILES[mode] || OSRM_PROFILES.driving;
-  const r = await fetch(
+  const r = await fetchWithRetry(
     `https://routing.openstreetmap.de/${profile}/${from.lon},${from.lat};${to.lon},${to.lat}?overview=false`,
     { headers: { 'User-Agent': 'MonBureau/2.3' } }
   );
@@ -1250,7 +1272,7 @@ async function routeTransitous(from, to, arrivalTime) {
     params.set('time', new Date(arrivalTime).toISOString());
     params.set('arriveBy', 'true');
   }
-  const r = await fetch(`https://api.transitous.org/api/v3/plan?${params}`, {
+  const r = await fetchWithRetry(`https://api.transitous.org/api/v3/plan?${params}`, {
     headers: { 'User-Agent': 'MonBureau/2.3' }
   });
   const data = await r.json();
