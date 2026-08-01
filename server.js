@@ -160,6 +160,14 @@ app.use(cors({
 }));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
+// sendBeacon peut envoyer le corps en text/plain : on le parse aussi en JSON.
+app.use(express.text({ type: ['text/plain', 'application/csp-report'], limit: '5mb' }));
+app.use((req, res, next) => {
+  if (typeof req.body === 'string' && req.body.trim().startsWith('{')) {
+    try { req.body = JSON.parse(req.body); } catch (e) {}
+  }
+  next();
+});
 
 const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Trop de requêtes, attends 1 min' } });
 
@@ -210,15 +218,28 @@ async function refreshAccessToken(refreshToken) {
     }).toString()
   });
   if (!res.ok) throw new Error('Token refresh failed');
-  return res.json();
+  const json = await res.json();
+  // IMPORTANT : Google ne renvoie PAS le refresh_token lors d'un rafraichissement.
+  // Sans cette ligne, le client ecrase son refresh_token par "undefined" et se
+  // retrouve deconnecte au bout d'une heure. On le reconduit explicitement.
+  if (!json.refresh_token) json.refresh_token = refreshToken;
+  if (json.expires_in && !json.expiry_date) {
+    json.expiry_date = Date.now() + (json.expires_in * 1000);
+  }
+  return json;
 }
 
 async function getValidAccessToken(tokens) {
-  if (tokens.access_token) return tokens.access_token;
+  // v3 : on verifie l'expiration AVANT d'utiliser le token.
+  // L'ancienne version renvoyait un access_token perime tant qu'il existait,
+  // ce qui provoquait des 401 en cascade et la sensation d'etre deconnectee.
+  const expired = tokens.expiry_date && tokens.expiry_date < (Date.now() + 60000);
+  if (tokens.access_token && !expired) return tokens.access_token;
   if (tokens.refresh_token) {
     const newTokens = await refreshAccessToken(tokens.refresh_token);
     return newTokens.access_token;
   }
+  if (tokens.access_token) return tokens.access_token;
   throw new Error('No valid token');
 }
 
@@ -817,10 +838,19 @@ function validateUserId(userId) {
   return userId;
 }
 
+// sendBeacon() ne permet aucun en-tete personnalise : quand l'appli se ferme
+// sur Android, l'identite arrive dans l'URL (?uid=) ou dans le corps JSON.
+// On accepte les trois sources, dans cet ordre de priorite.
+function resolveUserId(req) {
+  return validateUserId(req.headers['x-user-id'])
+      || validateUserId(req.query && req.query.uid)
+      || validateUserId(req.body && req.body.userId);
+}
+
 // Pull: récupérer toutes les données d'un user
 app.get('/sync/pull', async (req, res) => {
   try {
-    const userId = validateUserId(req.headers['x-user-id']);
+    const userId = resolveUserId(req);
     if (!userId) return res.status(400).json({ error: 'Invalid x-user-id' });
 
     if (!SYNC_DATA_KEY) return res.status(503).json({ error: 'Sync non configuree (SYNC_DATA_KEY manquante)' });
@@ -843,7 +873,7 @@ app.get('/sync/pull', async (req, res) => {
 // Push: sauvegarder des données (upsert)
 app.post('/sync/push', async (req, res) => {
   try {
-    const userId = validateUserId(req.headers['x-user-id']);
+    const userId = resolveUserId(req);
     if (!userId) return res.status(400).json({ error: 'Invalid x-user-id' });
 
     const { items } = req.body; // [{category, key, value}]
@@ -865,7 +895,7 @@ app.post('/sync/push', async (req, res) => {
 // Push: supprimer des données
 app.post('/sync/delete', async (req, res) => {
   try {
-    const userId = validateUserId(req.headers['x-user-id']);
+    const userId = resolveUserId(req);
     if (!userId) return res.status(400).json({ error: 'Invalid x-user-id' });
 
     const { category, key } = req.body;
