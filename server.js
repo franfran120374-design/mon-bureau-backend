@@ -35,7 +35,7 @@ async function supabaseRpc(fn, args) {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 
 // =================
 // CONFIG
