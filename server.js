@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import webPush from 'web-push';
+import mountEmploi from './emploi-routes.js';
 dotenv.config();
 
 // Supabase — projet ACTIF de Sandra (l'ancien tbbdkrapsmbzdfxxroda n'existe
