@@ -2303,9 +2303,7 @@ async function checkCalendarReminders() {
   }
 }
 // Tuile Emploi — branchement des routes /emploi/*
-import('./emploi-routes.js')
-  .then(m => m.default(app))
-  .catch(e => console.error('[Emploi] BRANCHEMENT ÉCHOUÉ :', e));
+mountEmploi(app);
 // =================
 // ERROR HANDLER
 // =================
