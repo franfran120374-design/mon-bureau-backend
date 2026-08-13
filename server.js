@@ -46,6 +46,7 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/auth/google/callback';
 const SCOPES = [
   'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile'
@@ -2300,7 +2301,8 @@ async function checkCalendarReminders() {
     console.warn('[Rappels] Vérification agenda échouée:', e.message);
   }
 }
-
+// Tuile Emploi — branchement des routes /emploi/*
+(await import('./emploi-routes.js')).default(app);
 // =================
 // ERROR HANDLER
 // =================
