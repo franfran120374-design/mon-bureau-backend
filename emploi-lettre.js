@@ -28,7 +28,7 @@
        → { success:false, error, essais:[...] }
    ========================================================= */
 
-const VERSION = '1.1.0';
+const VERSION = '1.3.0';
 
 const AGGREGATOR_URL   = process.env.AGGREGATOR_URL || '';
 const AGGREGATOR_TOKEN = process.env.AGGREGATOR_ACCESS_TOKEN || '';
@@ -253,6 +253,164 @@ async function redige(system, prompt, sources) {
 }
 
 // =========================================================
+// 4 bis. RELECTURE ORTHOGRAPHIQUE ET GRAMMATICALE
+// =========================================================
+//
+// Deuxième passage sur la lettre, consacré uniquement à la correction.
+// Aucun droit de réécrire : on compare le résultat à l'original et on
+// refuse la correction si elle a changé le fond (longueur, chiffres).
+
+// ---------------------------------------------------------
+// Correcteur LanguageTool : moteur à règles, gratuit, sans IA.
+// Il ne peut pas inventer : il signale une faute et propose un
+// remplacement. On applique uniquement les catégories sûres.
+// ---------------------------------------------------------
+
+const LT_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
+
+// Catégories appliquées automatiquement : fautes objectives.
+const LT_CATEGORIES_SURES = new Set([
+  'TYPOS',          // fautes de frappe et d'orthographe
+  'GRAMMAR',        // accords, conjugaison
+  'CASING',         // majuscules
+  'CONFUSED_WORDS', // a / à, ou / où, ce / se
+  'TYPOGRAPHY',     // espaces avant ; : ! ?, apostrophes
+  'PUNCTUATION',
+  'COMPOUNDING',
+  'MISC'
+]);
+
+// Règles écartées : trop bavardes ou stylistiques sur une lettre.
+const LT_REGLES_IGNOREES = [
+  'FRENCH_WHITESPACE',      // espaces insécables : illisible en texte brut
+  'UPPERCASE_SENTENCE_START_FR',
+  'AGREEMENT_POSTPONED_ADJ' // souvent faux positif sur les énumérations
+];
+
+async function corrigeLanguageTool(texte) {
+  const corrections = [];
+  if (!texte || texte.length > 19000) return { texte, corrections };
+
+  let matches;
+  try {
+    const body = new URLSearchParams();
+    body.set('language', 'fr');
+    body.set('text', texte);
+    body.set('level', 'default');
+
+    const ctrl = new AbortController();
+    const minuteur = setTimeout(() => ctrl.abort(), 15000);
+    const r = await fetch(LT_URL, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+    clearTimeout(minuteur);
+    if (!r.ok) throw new Error(`LanguageTool HTTP ${r.status}`);
+    matches = (await r.json()).matches || [];
+  } catch (e) {
+    console.warn('[Lettre] LanguageTool indisponible :', e.message);
+    return { texte, corrections };
+  }
+
+  // On applique de la fin vers le début : les positions restent valides.
+  const retenus = matches
+    .filter(m => m.replacements && m.replacements.length)
+    .filter(m => LT_CATEGORIES_SURES.has(m.rule?.category?.id))
+    .filter(m => !LT_REGLES_IGNOREES.includes(m.rule?.id))
+    .filter(m => m.replacements[0].value && m.replacements[0].value.length < 40)
+    .sort((a, b) => b.offset - a.offset);
+
+  let sortie = texte;
+  for (const m of retenus) {
+    const avant = sortie.slice(m.offset, m.offset + m.length);
+    const apres = m.replacements[0].value;
+    if (avant === apres) continue;
+    // Un correcteur ne doit jamais supprimer un chiffre
+    if (/\d/.test(avant) && !/\d/.test(apres)) continue;
+    sortie = sortie.slice(0, m.offset) + apres + sortie.slice(m.offset + m.length);
+    corrections.push(`« ${avant} » → « ${apres} »`);
+  }
+
+  return { texte: sortie, corrections: corrections.reverse() };
+}
+
+const CONSIGNE_RELECTURE = [
+  "Tu es correcteur professionnel de langue française. On te donne une lettre de motivation.",
+  "",
+  "TA SEULE MISSION : corriger les fautes. Rien d'autre.",
+  "- Orthographe et accents.",
+  "- Accords en genre et en nombre (participes passés, adjectifs, « souffrant » et non « souffrants »).",
+  "- Conjugaison et concordance des temps.",
+  "- Élisions et déterminants : « Mon expérience » et non « Ma expérience », « à AOEPS », « l'habitat ».",
+  "- Ponctuation, espaces avant les deux-points et points-virgules, majuscules.",
+  "- Répétitions immédiates d'un même mot dans une phrase.",
+  "",
+  "INTERDICTIONS ABSOLUES :",
+  "- Ne reformule aucune phrase correcte. Ne change pas le style.",
+  "- N'ajoute, ne supprime et ne déplace aucune information, aucun exemple, aucun paragraphe.",
+  "- N'ajoute AUCUN chiffre, aucune date, aucun pourcentage.",
+  "- Ne change pas la longueur : le texte corrigé doit faire le même nombre de phrases.",
+  "- N'ajoute ni commentaire, ni explication, ni liste des corrections.",
+  "",
+  "SORTIE : uniquement la lettre corrigée, rien avant, rien après."
+].join('\n');
+
+function memesNombres(a, b) {
+  const na = nombresDe(a).sort().join(',');
+  const nb = nombresDe(b).sort().join(',');
+  return na === nb;
+}
+
+async function relit(lettreOrigine) {
+  // Passage 1 : LanguageTool, moteur à règles. Déterministe et sûr.
+  const lt = await corrigeLanguageTool(lettreOrigine);
+  const lettre = lt.texte;
+  const corrections = lt.corrections.slice();
+
+  // Passage 2 : relecture IA, pour ce que les règles ne voient pas
+  // (concordance des temps, répétitions, tournures bancales).
+  const plan = [
+    { nom: 'agrégateur IA', fn: viaAgregateur },
+    { nom: 'MiMo',          fn: viaMimo }
+  ];
+
+  for (const etape of plan) {
+    try {
+      const { texte } = await etape.fn(CONSIGNE_RELECTURE, "LETTRE À CORRIGER :\n\n" + lettre);
+      const corrige = nettoie(texte);
+
+      // Contrôles : la correction ne doit pas avoir réécrit la lettre.
+      const ecart = Math.abs(corrige.length - lettre.length) / lettre.length;
+      if (!texteExploitable(corrige)) continue;
+      if (ecart > 0.18) continue;                    // trop de changement = réécriture
+      if (!memesNombres(lettre, corrige)) continue;  // chiffres modifiés = refus
+      if (formulesTrouvees(corrige).length > formulesTrouvees(lettre).length) continue;
+
+      return {
+        lettre: corrige,
+        relu: true,
+        correcteur: 'LanguageTool + ' + etape.nom,
+        corrections,
+        nbRegles: lt.corrections.length
+      };
+    } catch (e) {
+      // On passe au correcteur suivant
+    }
+  }
+
+  // L'IA n'a pas répondu : on garde au moins les corrections de règles.
+  return {
+    lettre,
+    relu: corrections.length > 0,
+    correcteur: corrections.length ? 'LanguageTool' : null,
+    corrections,
+    nbRegles: corrections.length
+  };
+}
+
+// =========================================================
 // 5. MONTAGE
 // =========================================================
 
@@ -284,14 +442,24 @@ export default function mountLettre(app) {
       // de chiffres légitimes.
       const r = await redige(String(system), String(prompt), [String(prompt)]);
 
-      console.log(`[Lettre] rédigée par ${r.fournisseur} en ${Math.round((Date.now() - debut) / 1000)}s` +
-                  (r.essais.length ? ` (après ${r.essais.length} échec(s))` : ''));
+      // Deuxième passage : correction orthographique et grammaticale.
+      // Elle ne peut que corriger, jamais réécrire (contrôles dans relit()).
+      const relecture = (req.body.relire === false)
+        ? { lettre: r.lettre, relu: false, correcteur: null }
+        : await relit(r.lettre);
+
+      console.log(`[Lettre] ${r.fournisseur} | relecture: ${relecture.relu ? relecture.correcteur : 'non'} | ` +
+                  `${Math.round((Date.now() - debut) / 1000)}s` +
+                  (r.essais.length ? ` | ${r.essais.length} échec(s)` : ''));
 
       res.json({
         success: true,
-        lettre: r.lettre,
+        lettre: relecture.lettre,
         fournisseur: r.fournisseur,
-        mots: r.lettre.split(/\s+/).length,
+        relu: relecture.relu,
+        correcteur: relecture.correcteur,
+        corrections: relecture.corrections || [],
+        mots: relecture.lettre.split(/\s+/).length,
         alertes: r.alertes || [],
         essais: r.essais
       });
@@ -307,5 +475,27 @@ export default function mountLettre(app) {
     }
   });
 
-  console.log('[Lettre] ✅ route chargée : /emploi/lettre (+ /emploi/lettre/ping)');
+  // Corrige un texte fourni tel quel : sert au bouton « Relire » de la
+  // tuile, une fois que tu as modifié la lettre à la main.
+  app.post('/emploi/relire', async (req, res) => {
+    try {
+      const { texte } = req.body || {};
+      if (!texte || String(texte).trim().length < 200) {
+        return res.status(400).json({ success: false, error: 'texte trop court' });
+      }
+      const r = await relit(String(texte));
+      res.json({
+        success: true,
+        texte: r.lettre,
+        relu: r.relu,
+        correcteur: r.correcteur,
+        corrections: r.corrections || [],
+        modifie: r.lettre !== String(texte)
+      });
+    } catch (e) {
+      res.status(503).json({ success: false, error: e.message });
+    }
+  });
+
+  console.log('[Lettre] ✅ routes chargées : /emploi/lettre, /emploi/relire (+ /emploi/lettre/ping)');
 }
