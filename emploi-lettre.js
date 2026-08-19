@@ -28,7 +28,7 @@
        → { success:false, error, essais:[...] }
    ========================================================= */
 
-const VERSION = '1.5.0';
+const VERSION = '1.9.0';
 
 const AGGREGATOR_URL   = process.env.AGGREGATOR_URL || '';
 const AGGREGATOR_TOKEN = process.env.AGGREGATOR_ACCESS_TOKEN || '';
@@ -63,12 +63,35 @@ function nombresDe(txt) {
     .map(n => n.replace(',', '.'));
 }
 
-// Nombres toujours tolérés : années, département, durées courantes.
+// Seules les années sont tolérées d'office. Tout le reste doit venir du CV
+// ou de l'annonce : « 4 ans de pompier volontaire » est passé parce que
+// j'autorisais les petits nombres. Plus maintenant.
 const NOMBRES_LIBRES = new Set([
-  '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '12', '15', '24', '31',
-  '2014', '2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022',
-  '2023', '2024', '2025', '2026', '2027'
+  '2014','2015','2016','2017','2018','2019','2020','2021','2022','2023','2024','2025','2026','2027'
 ]);
+
+// Les modèles contournent le contrôle en écrivant les nombres en toutes
+// lettres : « plus de vingt équipes ». On les traque aussi.
+const NOMBRES_EN_LETTRES = [
+  'deux','trois','quatre','cinq','six','sept','huit','neuf','dix','onze','douze',
+  'quinze','vingt','trente','quarante','cinquante','soixante','cent','mille',
+  'dizaine','dizaines','vingtaine','trentaine','quarantaine','cinquantaine',
+  'centaine','centaines','millier','milliers','douzaine'
+];
+
+// Une quantité annoncée : « plus de vingt », « une centaine de », « des dizaines »
+const QUANTIFIEURS = ['plus de', 'pres de', 'environ', 'une', 'des', 'quelque'];
+
+function quantitesEnLettres(lettre, sources) {
+  const l = sansAccentsMin(lettre);
+  const s = sansAccentsMin(sources.join(' '));
+  const trouves = [];
+  for (const n of NOMBRES_EN_LETTRES) {
+    const motif = new RegExp('(?:' + QUANTIFIEURS.join('|') + ')\\s+' + n + '\\b');
+    if (motif.test(l) && !s.includes(n)) trouves.push(n);
+  }
+  return [...new Set(trouves)];
+}
 
 function chiffresInventes(lettre, sources) {
   const autorises = new Set(NOMBRES_LIBRES);
@@ -124,6 +147,94 @@ function siglesInventes(lettre, sources) {
   });
 }
 
+// --- ACTES TECHNIQUES : le contrôle le plus important ---------------
+//
+// Un modèle qui lit une annonce de laboratoire écrit spontanément que la
+// candidate « réalise des prélèvements et centrifuge les tubes ». En santé,
+// affirmer un geste qu'on ne pratique pas est disqualifiant, voire grave.
+// On refuse donc toute lettre citant un acte technique absent du CV.
+
+const ACTES_TECHNIQUES = [
+  'prelevement', 'prelevements', 'prise de sang', 'ponction', 'veineux', 'veineuse',
+  'centrifugation', 'centrifuge', 'tube sec', 'tubes', 'pre analytique', 'preanalytique',
+  'perfusion', 'perfusions', 'cathete', 'voie veineuse', 'picc line', 'chambre implantable',
+  'injection', 'injections', 'intramusculaire', 'sous cutanee', 'intraveineuse',
+  'pansement', 'pansements', 'plaie', 'escarre', 'suture', 'agrafes', 'ablation de fils',
+  'sondage', 'sonde urinaire', 'sonde nasogastrique', 'stomie', 'colostomie',
+  'aspiration', 'tracheotomie', 'oxygenotherapie', 'aerosol', 'nebulisation',
+  'electrocardiogramme', 'ecg', 'glycemie capillaire', 'dextro', 'hemoglucotest',
+  'transfusion', 'chimiotherapie', 'dialyse', 'reanimation', 'intubation',
+  'bloc operatoire', 'instrumentation', 'sterilisation', 'asepsie chirurgicale',
+  'vaccination', 'vaccinations', 'test antigenique', 'frottis', 'ecbu',
+  'toilette', 'nursing', 'mobilisation', 'transfert de patient', 'contention',
+  'preparation des doses', 'pilulier', 'distribution des medicaments',
+  'analyse biologique', 'analyses biologiques', 'echantillon', 'echantillons',
+  'expedition des echantillons', 'identitovigilance', 'etiquetage',
+  'premiers secours', 'premier secours', 'secourisme', 'gestes de secours',
+  'defibrillateur', 'massage cardiaque', 'reanimation cardio', 'psc1', 'afgsu',
+  'pompier', 'sapeur pompier', 'secouriste', 'urgence vitale', 'triage',
+  'medecine du travail', 'sante au travail', 'visite medicale', 'aptitude',
+  'ergonomie du poste', 'risques professionnels', 'document unique', 'cse'
+];
+
+// Le CV contient deux parties séparées par ce marqueur : la pratique réelle
+// au-dessus, les habilitations du diplôme en dessous. Un acte listé dans les
+// habilitations peut être REVENDIQUÉ comme compétence, mais pas raconté comme
+// une pratique quotidienne.
+const MARQUEUR_HABILITATIONS = 'habilitations reglementaires';
+
+function coupeCv(cv) {
+  const plat = sansAccentsMin(cv);
+  const i = plat.indexOf(MARQUEUR_HABILITATIONS);
+  if (i === -1) return { pratique: cv, habilitations: '' };
+  return { pratique: cv.slice(0, i), habilitations: cv.slice(i) };
+}
+
+// Verbes qui transforment une habilitation en pratique revendiquée
+const VERBES_PRATIQUE = [
+  'je realise', 'je pratique', 'j effectue', 'j assure', 'je procede',
+  'j ai realise', 'j ai pratique', 'j ai effectue', 'j assurais', 'je realisais',
+  'je pratiquais', 'j effectuais', 'mon experience de', 'mon experience des',
+  'au quotidien', 'quotidiennement', 'chaque jour', 'regulierement',
+  'j ai supervise', 'je supervisais', 'j ai gere', 'je gerais', 'j ai mene'
+];
+
+function actesNonJustifies(lettre, sources) {
+  const texteSources = sansAccentsMin(sources.join(' '));
+  const texteLettre = sansAccentsMin(lettre);
+  const trouves = [];
+  for (const acte of ACTES_TECHNIQUES) {
+    if (!texteLettre.includes(acte)) continue;
+    if (texteSources.includes(acte)) continue;   // présent dans le CV : légitime
+    trouves.push(acte);
+  }
+  return [...new Set(trouves)];
+}
+
+// Détecte : « je réalisais des prélèvements » alors que le CV ne mentionne
+// les prélèvements que dans les habilitations réglementaires.
+function pratiqueRevendiqueeAtort(lettre, cv) {
+  const { pratique, habilitations } = coupeCv(cv);
+  if (!habilitations) return [];
+  const pratiquePlat = sansAccentsMin(pratique);
+  const habPlat = sansAccentsMin(habilitations);
+  const l = sansAccentsMin(lettre);
+  const fautes = [];
+
+  for (const acte of ACTES_TECHNIQUES) {
+    const pos = l.indexOf(acte);
+    if (pos === -1) continue;
+    if (pratiquePlat.includes(acte)) continue;      // pratique réelle : autorisé
+    if (!habPlat.includes(acte)) continue;          // traité par actesNonJustifies
+    // L'acte n'est qu'une habilitation : la phrase le présente-t-elle
+    // comme une pratique ?
+    const fenetre = l.slice(Math.max(0, pos - 160), pos + 160);
+    const verbe = VERBES_PRATIQUE.find(v => fenetre.includes(v));
+    if (verbe) fautes.push(`« ${acte} » présenté comme une pratique (« ${verbe} »)`);
+  }
+  return [...new Set(fautes)].slice(0, 5);
+}
+
 // --- La lettre est-elle complète ? ----------------------------------
 const FORMULES_FIN = [
   'veuillez agreer', 'veuillez recevoir', 'je vous prie d agreer',
@@ -145,6 +256,45 @@ function paragraphesCorrects(txt) {
   if (!corps.length) return true;
   const hachés = corps.filter(pp => (pp.match(/[.!?]/g) || []).length <= 1).length;
   return hachés <= Math.max(1, Math.floor(corps.length / 3));
+}
+
+// Le modèle a écrit « chez Mangeoter » pour Manpower. On vérifie que le
+// nom de la structure, s'il est cité, l'est correctement.
+function distance(a, b) {
+  const m = a.length, n = b.length;
+  const d = Array.from({ length: m + 1 }, (_, i) => [i].concat(new Array(n).fill(0)));
+  for (let j = 1; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                         d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+  }
+  return d[m][n];
+}
+
+// « Mangeoter » pour Manpower : le nom n'est pas absent, il est déformé.
+// On cherche dans la lettre un mot proche du nom de l'employeur sans être
+// identique — c'est la signature d'une hallucination de nom propre.
+function nomEmployeurDeforme(lettre, employeur) {
+  if (!employeur || employeur.length < 4) return null;
+  const propre = sansAccentsMin(employeur).trim();
+  const motPrincipal = propre.split(' ')
+    .filter(m => m.length >= 5 && !['france','groupe','centre','hopital','clinique','association'].includes(m))
+    .sort((a, b) => b.length - a.length)[0];
+  if (!motPrincipal) return null;
+
+  const l = sansAccentsMin(lettre);
+  if (l.includes(motPrincipal)) return null;          // nom correct : rien à signaler
+
+  const mots = [...new Set((l.match(/\b[a-z]{5,}\b/g) || []))];
+  for (const m of mots) {
+    if (Math.abs(m.length - motPrincipal.length) > 4) continue;
+    const d = distance(m, motPrincipal);
+    const proximite = 1 - d / Math.max(m.length, motPrincipal.length);
+    if (proximite >= 0.5 && proximite < 1) return m;   // ressemble sans être exact
+  }
+  return null;
 }
 
 function texteExploitable(txt) {
@@ -254,7 +404,7 @@ const PLAN = [
   { nom: 'MiMo (2e essai)',              fn: viaMimo,                 avant: 6000 }
 ];
 
-async function redige(system, prompt, sources) {
+async function redige(system, prompt, sources, cvSeul, employeur) {
   const essais = [];
   let repli = null;          // meilleure version imparfaite, au cas où
 
@@ -274,12 +424,33 @@ async function redige(system, prompt, sources) {
       const sigles   = siglesInventes(propre, sources);
       const tronquee = !lettreComplete(propre);
       const hachee   = !paragraphesCorrects(propre);
+      // Les actes se vérifient contre le CV UNIQUEMENT : si l'annonce parle
+      // de centrifugation, ça ne prouve pas que la candidate en fasse.
+      const actes    = actesNonJustifies(propre, [cvSeul || '']);
+      const quantites = quantitesEnLettres(propre, sources);
+      const nomFaux  = nomEmployeurDeforme(propre, employeur || '');
+      const bluff    = pratiqueRevendiqueeAtort(propre, cvSeul || '');
 
-      if (!inventes.length && !formules.length && !sigles.length && !tronquee && !hachee) {
+      const propreOk = !inventes.length && !formules.length && !sigles.length &&
+                       !tronquee && !hachee && !actes.length &&
+                       !quantites.length && !nomFaux && !bluff.length;
+
+      if (propreOk) {
+        // Dernier contrôle, le plus fin : une IA relit la lettre contre le CV
+        // et signale les affirmations qui n'y figurent pas.
+        const problemes = await verifieAffirmations(propre, cvSeul || '');
+        if (problemes && problemes.length) {
+          essais.push(`${etape.nom} : rejetée par la vérification — ` + problemes[0]);
+          continue;
+        }
         return { lettre: propre, fournisseur: `${etape.nom} (${modele})`, essais, alertes: [] };
       }
 
       const alertes = [];
+      if (bluff.length)    alertes.push('habilitation présentée comme une pratique : ' + bluff.join(' ; '));
+      if (nomFaux)         alertes.push('nom de l\'employeur déformé : « ' + nomFaux + ' »');
+      if (quantites.length) alertes.push('quantités inventées (en toutes lettres) : ' + quantites.join(', '));
+      if (actes.length)    alertes.push('ACTES TECHNIQUES non présents dans le CV : ' + actes.slice(0, 6).join(', '));
       if (sigles.length)   alertes.push('noms ou sigles introuvables dans le CV : ' + sigles.slice(0, 5).join(', '));
       if (inventes.length) alertes.push('chiffres non vérifiables : ' + inventes.slice(0, 6).join(', '));
       if (tronquee)        alertes.push('lettre incomplète : formule de politesse absente');
@@ -287,10 +458,15 @@ async function redige(system, prompt, sources) {
       if (formules.length) alertes.push('formules toutes faites : ' + formules.slice(0, 3).join(', '));
       essais.push(`${etape.nom} : rejetée — ${alertes.join(' ; ')}`);
 
-      // On garde la moins mauvaise en réserve : mieux vaut une lettre
-      // signalée qu'aucune lettre du tout.
-      const gravite = sigles.length * 5 + inventes.length * 3 +
-                      (tronquee ? 6 : 0) + (hachee ? 2 : 0) + formules.length;
+      // FAUTES GRAVES : affirmations fausses sur le parcours. Une telle
+      // lettre ne doit JAMAIS être proposée, même signalée — le risque
+      // qu'elle parte malgré l'avertissement est trop élevé.
+      const grave = actes.length > 0 || sigles.length > 0 || inventes.length > 0 ||
+                    quantites.length > 0 || !!nomFaux || bluff.length > 0;
+      if (grave) continue;
+
+      // Fautes mineures (mise en page, style) : on garde en réserve.
+      const gravite = (tronquee ? 6 : 0) + (hachee ? 2 : 0) + formules.length;
       if (!repli || gravite < repli.gravite) {
         repli = { lettre: propre, fournisseur: `${etape.nom} (${modele})`, gravite, alertes };
       }
@@ -309,9 +485,72 @@ async function redige(system, prompt, sources) {
     };
   }
 
-  const err = new Error('Aucun fournisseur IA disponible pour le moment.');
+  const graves = essais.filter(e => /ACTES TECHNIQUES|sigles introuvables|chiffres non|vérification|quantités|employeur/.test(e));
+  const err = new Error(graves.length
+    ? "Les lettres produites affirment des choses absentes de ton CV, elles ont toutes été refusées. " +
+      "Clique sur « Réécrire » pour relancer, ou vérifie que cette offre correspond vraiment à ton profil."
+    : 'Aucun fournisseur IA disponible pour le moment.');
   err.essais = essais;
   throw err;
+}
+
+// =========================================================
+// 4 quater. VÉRIFICATION DES AFFIRMATIONS
+// =========================================================
+//
+// Les règles ne peuvent pas attraper « pompier volontaire pendant 4 ans »
+// ou « élu CSE » : ce sont des phrases plausibles, sans chiffre suspect ni
+// sigle inconnu. Seule une relecture qui compare la lettre au CV les voit.
+// Ce contrôle est plus fiable que la génération : vérifier est plus simple
+// qu'écrire, même pour un petit modèle.
+
+function extraitJson(txt) {
+  const s = String(txt).replace(/```json/gi, '').replace(/```/g, '');
+  const d = s.indexOf('{');
+  const f = s.lastIndexOf('}');
+  if (d === -1 || f === -1 || f <= d) return null;
+  try { return JSON.parse(s.slice(d, f + 1)); } catch { return null; }
+}
+
+const CONSIGNE_VERIF = [
+  "Tu vérifies une lettre de motivation contre le CV de la candidate.",
+  "",
+  "Relève CHAQUE affirmation de la lettre qui n'est PAS confirmée par le CV :",
+  "- une expérience, un poste, un engagement (bénévolat, mandat, association) absent du CV",
+  "- un geste technique présenté comme une PRATIQUE alors que le CV ne le mentionne que",
+  "  dans le bloc HABILITATIONS RÉGLEMENTAIRES. Dire « je suis habilitée à » est correct ;",
+  "  dire « je réalise » ou « j'assurais » ne l'est pas si l'expérience n'en parle pas.",
+  "- un geste technique absent à la fois de l'expérience et des habilitations",
+  "- un chiffre, une durée, une quantité, une date absente du CV",
+  "- un résultat, un effet obtenu, une amélioration mesurée non écrite dans le CV",
+  "- un outil, un logiciel, une méthode que le CV n'attribue pas à la candidate",
+  "- un emploi présenté au passé alors que le CV le situe dans le futur",
+  "",
+  "Sois strict : dans le doute, signale. Une affirmation reformulée mais",
+  "fidèle au CV n'est PAS un problème ; une affirmation ajoutée l'est.",
+  "",
+  "RÉPONDS UNIQUEMENT PAR CE JSON, sans texte autour, sans balises de code :",
+  '{"problemes":[{"phrase":"...","pourquoi":"..."}]}',
+  'S\'il n\'y a aucun probleme, reponds exactement : {"problemes":[]}'
+].join('\n');
+
+async function verifieAffirmations(lettre, cv) {
+  for (const fn of [viaAgregateur, viaMimo]) {
+    try {
+      const { texte } = await fn(CONSIGNE_VERIF,
+        "=== CV ===\n" + cv + "\n\n=== LETTRE À VÉRIFIER ===\n" + lettre);
+      const j = extraitJson(texte);
+      if (j && Array.isArray(j.problemes)) {
+        return j.problemes
+          .filter(p => p && p.phrase)
+          .slice(0, 8)
+          .map(p => String(p.phrase).slice(0, 160) + ' — ' + String(p.pourquoi || '').slice(0, 120));
+      }
+    } catch (e) {
+      // vérificateur suivant
+    }
+  }
+  return null;   // vérification impossible : on ne bloque pas pour autant
 }
 
 // =========================================================
@@ -337,19 +576,28 @@ const CONSIGNE_ANALYSE = [
   "ÉTAPE 3 : note la solidité du lien : \"forte\" (expérience directe et prouvée),",
   "\"moyenne\" (compétence transférable), \"aucune\".",
   "",
+  "ÉTAPE 4 — LA PLUS IMPORTANTE QUAND LE CV NE COLLE PAS :",
+  "Pour chaque exigence notée \"aucune\", cherche dans le CV la compétence ADJACENTE la plus",
+  "proche : celle qui ne remplace pas l'exigence mais qui aide à l'exercer. Mets-la dans le",
+  "champ \"adjacent\". Exemple : si l'annonce demande des prélèvements sanguins et qu'elle n'en",
+  "fait pas, l'adjacent peut être sa connaissance des circuits de soins et des protocoles de",
+  "traçabilité. Sois honnête : l'adjacent n'est jamais présenté comme équivalent.",
+  "Si vraiment rien n'est adjacent, laisse \"adjacent\" vide.",
+  "",
+  "ÉTAPE 5 : relève 2 à 3 ATOUTS du CV que l'annonce ne demande pas mais qui apporteraient",
+  "une vraie valeur à CET employeur, dans SON contexte. Cherche large et utilise tout le CV :",
+  "langues étrangères, formations spécifiques, capacité à créer des outils numériques,",
+  "expérience interculturelle, animation de réseau, gestion de crise, formation initiale",
+  "administrative, publics particuliers déjà accompagnés. Pour chacun, dis en une phrase",
+  "ce qu'il apporterait concrètement à cet employeur précis. Rien d'inventé : tout doit être",
+  "dans le CV.",
+  "",
   "RÉPONDS UNIQUEMENT PAR CE JSON, sans texte autour, sans balises de code :",
-  '{"exigences":[{"annonce":"...","parcours":"...","lien":"forte|moyenne|aucune"}]}',
+  '{"exigences":[{"annonce":"...","parcours":"...","lien":"forte|moyenne|aucune","adjacent":"..."}],' +
+  '"atouts":[{"atout":"...","apport":"..."}]}',
   "",
   "N'invente aucun élément de parcours. N'ajoute aucun chiffre."
 ].join('\n');
-
-function extraitJson(txt) {
-  const s = String(txt).replace(/```json/gi, '').replace(/```/g, '');
-  const d = s.indexOf('{');
-  const f = s.lastIndexOf('}');
-  if (d === -1 || f === -1 || f <= d) return null;
-  try { return JSON.parse(s.slice(d, f + 1)); } catch { return null; }
-}
 
 async function correspondances(cv, annonce) {
   const prompt = "=== CV ===\n" + cv + "\n\n=== ANNONCE ===\n" + annonce;
@@ -359,35 +607,68 @@ async function correspondances(cv, annonce) {
       const j = extraitJson(texte);
       const liste = Array.isArray(j?.exigences) ? j.exigences : null;
       if (liste && liste.length) {
-        return liste
+        const exigences = liste
           .filter(e => e && e.annonce)
           .slice(0, 6)
           .map(e => ({
             annonce: String(e.annonce).slice(0, 220),
             parcours: String(e.parcours || 'AUCUNE').slice(0, 300),
-            lien: ['forte', 'moyenne', 'aucune'].includes(e.lien) ? e.lien : 'moyenne'
+            lien: ['forte', 'moyenne', 'aucune'].includes(e.lien) ? e.lien : 'moyenne',
+            adjacent: String(e.adjacent || '').slice(0, 250)
           }));
+        const atouts = (Array.isArray(j?.atouts) ? j.atouts : [])
+          .filter(a => a && a.atout)
+          .slice(0, 4)
+          .map(a => ({
+            atout: String(a.atout).slice(0, 160),
+            apport: String(a.apport || '').slice(0, 260)
+          }));
+        return { exigences, atouts };
       }
     } catch (e) {
       // fournisseur suivant
     }
   }
-  return [];
+  return { exigences: [], atouts: [] };
 }
 
-function tableEnTexte(liste) {
-  if (!liste.length) return '';
-  const lignes = liste.map((e, i) =>
-    `${i + 1}. CE QUE L'ANNONCE DEMANDE : ${e.annonce}\n` +
-    `   CE QUE SON PARCOURS APPORTE  : ${e.parcours}\n` +
-    `   SOLIDITÉ DU LIEN             : ${e.lien}`
-  );
-  return "=== PLAN DE CORRESPONDANCE (établi à partir de l'annonce et du CV) ===\n" +
-    lignes.join('\n\n') + "\n\n" +
-    "Construis la lettre sur ce plan. Traite en priorité les liens « forte », puis « moyenne ».\n" +
-    "N'aborde JAMAIS les points marqués « aucune » : elle n'a pas cette compétence.\n" +
-    "Pour chaque point traité, la phrase doit contenir les deux moitiés : ce que l'annonce\n" +
-    "attend, puis ce qu'elle a fait qui y répond. Jamais l'un sans l'autre.\n";
+function tableEnTexte(donnees) {
+  const liste = donnees.exigences || [];
+  const atouts = donnees.atouts || [];
+  if (!liste.length && !atouts.length) return '';
+
+  let txt = '';
+
+  if (liste.length) {
+    txt += "=== PLAN DE CORRESPONDANCE (annonce ↔ parcours) ===\n" +
+      liste.map((e, i) =>
+        `${i + 1}. CE QUE L'ANNONCE DEMANDE : ${e.annonce}\n` +
+        `   CE QUE SON PARCOURS APPORTE  : ${e.parcours}\n` +
+        `   SOLIDITÉ DU LIEN             : ${e.lien}` +
+        (e.adjacent ? `\n   COMPÉTENCE ADJACENTE         : ${e.adjacent}` : '')
+      ).join('\n\n') + "\n\n";
+  }
+
+  if (atouts.length) {
+    txt += "=== ATOUTS À METTRE EN AVANT (non demandés, mais utiles à cet employeur) ===\n" +
+      atouts.map((a, i) => `${i + 1}. ${a.atout}\n   Apport concret : ${a.apport}`).join('\n') + "\n\n";
+  }
+
+  txt +=
+    "COMMENT UTILISER CE PLAN :\n" +
+    "- Traite d'abord les liens « forte », puis « moyenne ». Chaque phrase noue les deux moitiés :\n" +
+    "  ce que l'annonce attend, puis ce qu'elle a fait qui y répond.\n" +
+    "- Les points « aucune » : ne prétends JAMAIS qu'elle sait les faire. Mais s'il existe une\n" +
+    "  COMPÉTENCE ADJACENTE, tu peux l'utiliser en étant explicite sur la limite, par exemple :\n" +
+    "  « Je n'exerce pas X au quotidien ; en revanche Y, que j'ai mené à Z, m'a rendue familière\n" +
+    "  de ce que cela suppose. » Une phrase de ce type, jamais plus d'une dans la lettre.\n" +
+    "- Consacre au moins un passage aux ATOUTS ci-dessus : c'est ce qui la distingue des autres\n" +
+    "  candidatures. Ne les énumère pas en liste : intègre-les en montrant leur utilité pour\n" +
+    "  CET employeur.\n" +
+    "- Si le plan comporte peu de liens forts, la lettre reste courte et honnête, centrée sur\n" +
+    "  les atouts et sur ce qu'elle sait réellement faire.\n";
+
+  return txt;
 }
 
 // =========================================================
@@ -576,7 +857,7 @@ export default function mountLettre(app) {
       // Étape préalable : mettre l'annonce et le parcours en vis-à-vis.
       // Si l'analyse échoue, on continue sans : mieux vaut une lettre
       // moins reliée que pas de lettre du tout.
-      let table = [];
+      let table = { exigences: [], atouts: [] };
       if (cv && annonce) {
         try { table = await correspondances(String(cv), String(annonce)); }
         catch (e) { console.warn('[Lettre] correspondances indisponibles :', e.message); }
@@ -589,7 +870,9 @@ export default function mountLettre(app) {
       // Le prompt contient le CV et l'annonce : ce sont les seules sources
       // de chiffres légitimes.
       const promptComplet = plan ? (plan + '\n' + String(prompt)) : String(prompt);
-      const r = await redige(String(system), promptComplet, [String(prompt)]);
+      const employeur = (String(annonce || '').match(/Structure\s*:\s*(.+)/) || [])[1] || '';
+      const r = await redige(String(system), promptComplet, [String(prompt)],
+                            String(cv || ''), employeur.trim());
 
       // Deuxième passage : correction orthographique et grammaticale.
       // Elle ne peut que corriger, jamais réécrire (contrôles dans relit()).
@@ -597,7 +880,8 @@ export default function mountLettre(app) {
         ? { lettre: r.lettre, relu: false, correcteur: null }
         : await relit(r.lettre);
 
-      console.log(`[Lettre] ${table.length} correspondance(s) | ${r.fournisseur} | ` +
+      console.log(`[Lettre] ${(table.exigences || []).length} correspondance(s), ` +
+                  `${(table.atouts || []).length} atout(s) | ${r.fournisseur} | ` +
                   `relecture: ${relecture.relu ? relecture.correcteur : 'non'} | ` +
                   `${Math.round((Date.now() - debut) / 1000)}s` +
                   (r.essais.length ? ` | ${r.essais.length} échec(s)` : ''));
@@ -610,7 +894,8 @@ export default function mountLettre(app) {
         correcteur: relecture.correcteur,
         corrections: relecture.corrections || [],
         mots: relecture.lettre.split(/\s+/).length,
-        correspondances: table,
+        correspondances: table.exigences || [],
+        atouts: table.atouts || [],
         alertes: r.alertes || [],
         essais: r.essais
       });
