@@ -28,7 +28,7 @@
        → { success:false, error, essais:[...] }
    ========================================================= */
 
-const VERSION = '1.3.0';
+const VERSION = '1.5.0';
 
 const AGGREGATOR_URL   = process.env.AGGREGATOR_URL || '';
 const AGGREGATOR_TOKEN = process.env.AGGREGATOR_ACCESS_TOKEN || '';
@@ -97,6 +97,56 @@ function formulesTrouvees(lettre) {
   return FORMULES_BANNIES.filter(f => plat.includes(f));
 }
 
+// --- Noms propres et sigles inventés -------------------------------
+// Le modèle a produit « l'application CORPS » au lieu d'AOEPS et
+// « l'CM » au lieu d'UCRM. On vérifie que tout sigle en majuscules
+// et tout nom d'outil cité existe bien dans le CV ou dans l'annonce.
+
+const SIGLES_COURANTS = new Set([
+  'CDI','CDD','IDE','IDEC','ETP','RH','SMS','EHPAD','ACT','LHSS','CHU','CH',
+  'SAMU','ARS','CPAM','MDPH','ESAT','SAVS','SAMSAH','CMP','CATTP','HAS','IFSI',
+  'PASS','CAARUD','CSAPA','PCH','AAH','RSA','CAF','CCAS','UDAF','FR','TCC','SPDT'
+]);
+
+function siglesDe(txt) {
+  return (String(txt).match(/\b[A-ZÉÈÀÂÎÔÛ]{2,}[0-9]*\b/g) || [])
+    .filter(s => s.length >= 2 && s.length <= 12);
+}
+
+function siglesInventes(lettre, sources) {
+  const connus = new Set(SIGLES_COURANTS);
+  for (const s of sources) for (const g of siglesDe(s)) connus.add(g);
+  const vus = new Set();
+  return siglesDe(lettre).filter(g => {
+    if (connus.has(g) || vus.has(g)) return false;
+    vus.add(g);
+    return true;
+  });
+}
+
+// --- La lettre est-elle complète ? ----------------------------------
+const FORMULES_FIN = [
+  'veuillez agreer', 'veuillez recevoir', 'je vous prie d agreer',
+  'salutations distinguees', 'sentiments distingues', 'cordialement',
+  'respectueuses salutations', 'sinceres salutations', 'consideration distinguee'
+];
+
+function lettreComplete(txt) {
+  const fin = sansAccentsMin(String(txt).slice(-320));
+  return FORMULES_FIN.some(f => fin.includes(f));
+}
+
+// --- Mise en page : des paragraphes, pas une phrase par ligne -------
+function paragraphesCorrects(txt) {
+  const paras = String(txt).split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+  if (paras.length < 3 || paras.length > 8) return false;
+  // Un corps découpé en une phrase par bloc = mise en page hachée
+  const corps = paras.slice(1, -1);
+  if (!corps.length) return true;
+  const hachés = corps.filter(pp => (pp.match(/[.!?]/g) || []).length <= 1).length;
+  return hachés <= Math.max(1, Math.floor(corps.length / 3));
+}
+
 function texteExploitable(txt) {
   if (!txt || typeof txt !== 'string') return false;
   const s = txt.trim();
@@ -126,7 +176,11 @@ function pause(ms) { return new Promise(r => setTimeout(r, ms)); }
 // 2. FOURNISSEUR A — AGRÉGATEUR IA (multi-modèles, le meilleur)
 // =========================================================
 
-async function viaAgregateur(system, prompt) {
+async function viaAgregateurRedaction(system, prompt) {
+  return viaAgregateur(system, prompt, 'redaction');
+}
+
+async function viaAgregateur(system, prompt, categorie) {
   if (!AGGREGATOR_URL) throw new Error('AGGREGATOR_URL non configurée');
 
   // L'agrégateur n'a pas de champ « system » séparé : on fusionne.
@@ -138,7 +192,7 @@ async function viaAgregateur(system, prompt) {
       'Content-Type': 'application/json',
       ...(AGGREGATOR_TOKEN ? { 'X-Access-Token': AGGREGATOR_TOKEN } : {})
     },
-    body: JSON.stringify({ prompt: complet, category: 'redaction' })
+    body: JSON.stringify({ prompt: complet, category: categorie || 'raisonnement' })
   });
 
   if (!r.ok) {
@@ -193,10 +247,11 @@ async function viaMimo(system, prompt) {
 // sur l'agrégateur après une pause au cas où c'était une saturation
 // passagère. Chaque échec est consigné pour pouvoir être affiché.
 const PLAN = [
-  { nom: 'agrégateur IA', fn: viaAgregateur, avant: 0 },
-  { nom: 'MiMo',          fn: viaMimo,       avant: 0 },
-  { nom: 'agrégateur IA (2e essai)', fn: viaAgregateur, avant: 9000 },
-  { nom: 'MiMo (2e essai)',          fn: viaMimo,       avant: 6000 }
+  { nom: 'agrégateur IA (raisonnement)', fn: viaAgregateur,           avant: 0 },
+  { nom: 'MiMo',                         fn: viaMimo,                 avant: 0 },
+  { nom: 'agrégateur IA (rédaction)',    fn: viaAgregateurRedaction,  avant: 6000 },
+  { nom: 'agrégateur IA (2e raisonnement)', fn: viaAgregateur,        avant: 9000 },
+  { nom: 'MiMo (2e essai)',              fn: viaMimo,                 avant: 6000 }
 ];
 
 async function redige(system, prompt, sources) {
@@ -216,19 +271,26 @@ async function redige(system, prompt, sources) {
 
       const inventes = chiffresInventes(propre, sources);
       const formules = formulesTrouvees(propre);
+      const sigles   = siglesInventes(propre, sources);
+      const tronquee = !lettreComplete(propre);
+      const hachee   = !paragraphesCorrects(propre);
 
-      if (!inventes.length && !formules.length) {
+      if (!inventes.length && !formules.length && !sigles.length && !tronquee && !hachee) {
         return { lettre: propre, fournisseur: `${etape.nom} (${modele})`, essais, alertes: [] };
       }
 
       const alertes = [];
+      if (sigles.length)   alertes.push('noms ou sigles introuvables dans le CV : ' + sigles.slice(0, 5).join(', '));
       if (inventes.length) alertes.push('chiffres non vérifiables : ' + inventes.slice(0, 6).join(', '));
+      if (tronquee)        alertes.push('lettre incomplète : formule de politesse absente');
+      if (hachee)          alertes.push('mise en page hachée : une phrase par paragraphe');
       if (formules.length) alertes.push('formules toutes faites : ' + formules.slice(0, 3).join(', '));
       essais.push(`${etape.nom} : rejetée — ${alertes.join(' ; ')}`);
 
       // On garde la moins mauvaise en réserve : mieux vaut une lettre
       // signalée qu'aucune lettre du tout.
-      const gravite = inventes.length * 3 + formules.length;
+      const gravite = sigles.length * 5 + inventes.length * 3 +
+                      (tronquee ? 6 : 0) + (hachee ? 2 : 0) + formules.length;
       if (!repli || gravite < repli.gravite) {
         repli = { lettre: propre, fournisseur: `${etape.nom} (${modele})`, gravite, alertes };
       }
@@ -250,6 +312,82 @@ async function redige(system, prompt, sources) {
   const err = new Error('Aucun fournisseur IA disponible pour le moment.');
   err.essais = essais;
   throw err;
+}
+
+// =========================================================
+// 4 ter. MISE EN CORRESPONDANCE ANNONCE ↔ PARCOURS
+// =========================================================
+//
+// Avant d'écrire, on établit une table : chaque exigence de l'annonce
+// face à l'élément précis du CV qui y répond. La lettre est ensuite
+// rédigée À PARTIR de cette table, ce qui l'oblige à faire le lien
+// au lieu de juxtaposer un portrait et une offre.
+
+const CONSIGNE_ANALYSE = [
+  "Tu compares une annonce d'emploi et le CV d'une candidate.",
+  "",
+  "ÉTAPE 1 : relève dans l'annonce les 5 exigences les plus importantes.",
+  "Une exigence = une mission, une compétence, un public, une contrainte ou un savoir-être",
+  "réellement écrit dans l'annonce. Cite-la avec les mots de l'annonce, en une ligne.",
+  "",
+  "ÉTAPE 2 : pour chaque exigence, cherche dans le CV l'élément le PLUS PRÉCIS qui y répond.",
+  "Un élément = une mission datée, une réalisation, une formation, un outil créé.",
+  "Si rien dans le CV n'y répond, écris exactement : AUCUNE. Ne force jamais un rapprochement.",
+  "",
+  "ÉTAPE 3 : note la solidité du lien : \"forte\" (expérience directe et prouvée),",
+  "\"moyenne\" (compétence transférable), \"aucune\".",
+  "",
+  "RÉPONDS UNIQUEMENT PAR CE JSON, sans texte autour, sans balises de code :",
+  '{"exigences":[{"annonce":"...","parcours":"...","lien":"forte|moyenne|aucune"}]}',
+  "",
+  "N'invente aucun élément de parcours. N'ajoute aucun chiffre."
+].join('\n');
+
+function extraitJson(txt) {
+  const s = String(txt).replace(/```json/gi, '').replace(/```/g, '');
+  const d = s.indexOf('{');
+  const f = s.lastIndexOf('}');
+  if (d === -1 || f === -1 || f <= d) return null;
+  try { return JSON.parse(s.slice(d, f + 1)); } catch { return null; }
+}
+
+async function correspondances(cv, annonce) {
+  const prompt = "=== CV ===\n" + cv + "\n\n=== ANNONCE ===\n" + annonce;
+  for (const fn of [viaAgregateur, viaMimo]) {
+    try {
+      const { texte } = await fn(CONSIGNE_ANALYSE, prompt);
+      const j = extraitJson(texte);
+      const liste = Array.isArray(j?.exigences) ? j.exigences : null;
+      if (liste && liste.length) {
+        return liste
+          .filter(e => e && e.annonce)
+          .slice(0, 6)
+          .map(e => ({
+            annonce: String(e.annonce).slice(0, 220),
+            parcours: String(e.parcours || 'AUCUNE').slice(0, 300),
+            lien: ['forte', 'moyenne', 'aucune'].includes(e.lien) ? e.lien : 'moyenne'
+          }));
+      }
+    } catch (e) {
+      // fournisseur suivant
+    }
+  }
+  return [];
+}
+
+function tableEnTexte(liste) {
+  if (!liste.length) return '';
+  const lignes = liste.map((e, i) =>
+    `${i + 1}. CE QUE L'ANNONCE DEMANDE : ${e.annonce}\n` +
+    `   CE QUE SON PARCOURS APPORTE  : ${e.parcours}\n` +
+    `   SOLIDITÉ DU LIEN             : ${e.lien}`
+  );
+  return "=== PLAN DE CORRESPONDANCE (établi à partir de l'annonce et du CV) ===\n" +
+    lignes.join('\n\n') + "\n\n" +
+    "Construis la lettre sur ce plan. Traite en priorité les liens « forte », puis « moyenne ».\n" +
+    "N'aborde JAMAIS les points marqués « aucune » : elle n'a pas cette compétence.\n" +
+    "Pour chaque point traité, la phrase doit contenir les deux moitiés : ce que l'annonce\n" +
+    "attend, puis ce qu'elle a fait qui y répond. Jamais l'un sans l'autre.\n";
 }
 
 // =========================================================
@@ -430,17 +568,28 @@ export default function mountLettre(app) {
   app.post('/emploi/lettre', async (req, res) => {
     const debut = Date.now();
     try {
-      const { system, prompt } = req.body || {};
+      const { system, prompt, cv, annonce } = req.body || {};
       if (!system || !prompt) {
         return res.status(400).json({ success: false, error: 'system et prompt sont requis' });
       }
+
+      // Étape préalable : mettre l'annonce et le parcours en vis-à-vis.
+      // Si l'analyse échoue, on continue sans : mieux vaut une lettre
+      // moins reliée que pas de lettre du tout.
+      let table = [];
+      if (cv && annonce) {
+        try { table = await correspondances(String(cv), String(annonce)); }
+        catch (e) { console.warn('[Lettre] correspondances indisponibles :', e.message); }
+      }
+      const plan = tableEnTexte(table);
       if (String(prompt).length > 24000) {
         return res.status(400).json({ success: false, error: 'prompt trop long' });
       }
 
       // Le prompt contient le CV et l'annonce : ce sont les seules sources
       // de chiffres légitimes.
-      const r = await redige(String(system), String(prompt), [String(prompt)]);
+      const promptComplet = plan ? (plan + '\n' + String(prompt)) : String(prompt);
+      const r = await redige(String(system), promptComplet, [String(prompt)]);
 
       // Deuxième passage : correction orthographique et grammaticale.
       // Elle ne peut que corriger, jamais réécrire (contrôles dans relit()).
@@ -448,7 +597,8 @@ export default function mountLettre(app) {
         ? { lettre: r.lettre, relu: false, correcteur: null }
         : await relit(r.lettre);
 
-      console.log(`[Lettre] ${r.fournisseur} | relecture: ${relecture.relu ? relecture.correcteur : 'non'} | ` +
+      console.log(`[Lettre] ${table.length} correspondance(s) | ${r.fournisseur} | ` +
+                  `relecture: ${relecture.relu ? relecture.correcteur : 'non'} | ` +
                   `${Math.round((Date.now() - debut) / 1000)}s` +
                   (r.essais.length ? ` | ${r.essais.length} échec(s)` : ''));
 
@@ -460,6 +610,7 @@ export default function mountLettre(app) {
         correcteur: relecture.correcteur,
         corrections: relecture.corrections || [],
         mots: relecture.lettre.split(/\s+/).length,
+        correspondances: table,
         alertes: r.alertes || [],
         essais: r.essais
       });
