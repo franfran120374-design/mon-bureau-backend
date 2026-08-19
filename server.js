@@ -9,6 +9,7 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import webPush from 'web-push';
 import mountEmploi from './emploi-routes.js';
+import mountLettre from './emploi-lettre.js';
 import mountVlog from './vlog-routes.js';
 dotenv.config();
 
@@ -2306,6 +2307,7 @@ async function checkCalendarReminders() {
 }
 // Tuile Emploi — branchement des routes /emploi/*
 mountEmploi(app);
+mountLettre(app);
 mountVlog(app, { getStoredGoogleRefreshToken, refreshAccessToken });
 // =================
 // ERROR HANDLER
