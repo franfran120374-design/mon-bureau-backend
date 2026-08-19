@@ -28,7 +28,7 @@
        → { success:false, error, essais:[...] }
    ========================================================= */
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 const AGGREGATOR_URL   = process.env.AGGREGATOR_URL || '';
 const AGGREGATOR_TOKEN = process.env.AGGREGATOR_ACCESS_TOKEN || '';
@@ -47,6 +47,55 @@ const SIGNES_ERREUR = [
   'overloaded', 'invalid api key', 'unauthorized', 'insufficient',
   'internal server error', 'context length', '⚠️'
 ];
+
+// =========================================================
+// 1 bis. GARDE-FOU CONTRE LES CHIFFRES INVENTÉS
+// =========================================================
+//
+// Les petits modèles fabriquent des statistiques pour « faire pro » :
+// « 200 patients suivis », « satisfaction en hausse de 12 % ». Ces
+// affirmations sont invérifiables et exposent la candidate en entretien.
+// On refuse donc toute lettre contenant un nombre absent du CV et de
+// l'annonce, et on relance un autre fournisseur.
+
+function nombresDe(txt) {
+  return (String(txt).match(/\d+(?:[.,]\d+)?/g) || [])
+    .map(n => n.replace(',', '.'));
+}
+
+// Nombres toujours tolérés : années, département, durées courantes.
+const NOMBRES_LIBRES = new Set([
+  '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '12', '15', '24', '31',
+  '2014', '2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022',
+  '2023', '2024', '2025', '2026', '2027'
+]);
+
+function chiffresInventes(lettre, sources) {
+  const autorises = new Set(NOMBRES_LIBRES);
+  for (const s of sources) for (const n of nombresDe(s)) autorises.add(n);
+  return nombresDe(lettre).filter(n => !autorises.has(n));
+}
+
+// Formules qui trahissent une lettre générée. Leur présence suffit à
+// rejeter la version et à en demander une autre.
+const FORMULES_BANNIES = [
+  'fort de mon experience', 'forte de mon experience', 'vif interet',
+  'je me permets de', 'dynamique et motive', 'n hesitez pas',
+  'je serais ravi', 'je serais heureu', 'je suis convaincu',
+  'prestigieuse', 'votre renommee', 'polyvalente et rigoureuse',
+  'a l ecoute et bienveillante', 'mettre mes competences au service',
+  's integrent parfaitement', 'parfaitement aux exigences'
+];
+
+function sansAccentsMin(s) {
+  return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+}
+
+function formulesTrouvees(lettre) {
+  const plat = sansAccentsMin(lettre);
+  return FORMULES_BANNIES.filter(f => plat.includes(f));
+}
 
 function texteExploitable(txt) {
   if (!txt || typeof txt !== 'string') return false;
@@ -150,21 +199,52 @@ const PLAN = [
   { nom: 'MiMo (2e essai)',          fn: viaMimo,       avant: 6000 }
 ];
 
-async function redige(system, prompt) {
+async function redige(system, prompt, sources) {
   const essais = [];
+  let repli = null;          // meilleure version imparfaite, au cas où
 
   for (const etape of PLAN) {
     if (etape.avant) await pause(etape.avant);
     try {
       const { texte, modele } = await etape.fn(system, prompt);
       const propre = nettoie(texte);
-      if (texteExploitable(propre)) {
-        return { lettre: propre, fournisseur: `${etape.nom} (${modele})`, essais };
+
+      if (!texteExploitable(propre)) {
+        essais.push(`${etape.nom} : réponse inutilisable (${propre.slice(0, 80) || 'vide'})`);
+        continue;
       }
-      essais.push(`${etape.nom} : réponse inutilisable (${propre.slice(0, 90) || 'vide'})`);
+
+      const inventes = chiffresInventes(propre, sources);
+      const formules = formulesTrouvees(propre);
+
+      if (!inventes.length && !formules.length) {
+        return { lettre: propre, fournisseur: `${etape.nom} (${modele})`, essais, alertes: [] };
+      }
+
+      const alertes = [];
+      if (inventes.length) alertes.push('chiffres non vérifiables : ' + inventes.slice(0, 6).join(', '));
+      if (formules.length) alertes.push('formules toutes faites : ' + formules.slice(0, 3).join(', '));
+      essais.push(`${etape.nom} : rejetée — ${alertes.join(' ; ')}`);
+
+      // On garde la moins mauvaise en réserve : mieux vaut une lettre
+      // signalée qu'aucune lettre du tout.
+      const gravite = inventes.length * 3 + formules.length;
+      if (!repli || gravite < repli.gravite) {
+        repli = { lettre: propre, fournisseur: `${etape.nom} (${modele})`, gravite, alertes };
+      }
+
     } catch (e) {
       essais.push(`${etape.nom} : ${e.message}`);
     }
+  }
+
+  if (repli) {
+    return {
+      lettre: repli.lettre,
+      fournisseur: repli.fournisseur + ' — À RELIRE',
+      essais,
+      alertes: repli.alertes
+    };
   }
 
   const err = new Error('Aucun fournisseur IA disponible pour le moment.');
@@ -200,7 +280,9 @@ export default function mountLettre(app) {
         return res.status(400).json({ success: false, error: 'prompt trop long' });
       }
 
-      const r = await redige(String(system), String(prompt));
+      // Le prompt contient le CV et l'annonce : ce sont les seules sources
+      // de chiffres légitimes.
+      const r = await redige(String(system), String(prompt), [String(prompt)]);
 
       console.log(`[Lettre] rédigée par ${r.fournisseur} en ${Math.round((Date.now() - debut) / 1000)}s` +
                   (r.essais.length ? ` (après ${r.essais.length} échec(s))` : ''));
@@ -210,6 +292,7 @@ export default function mountLettre(app) {
         lettre: r.lettre,
         fournisseur: r.fournisseur,
         mots: r.lettre.split(/\s+/).length,
+        alertes: r.alertes || [],
         essais: r.essais
       });
 
