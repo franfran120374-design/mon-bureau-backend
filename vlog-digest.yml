@@ -1,0 +1,33 @@
+# =========================================================
+# Digest quotidien du Vlog — Mon Bureau
+# -------------------------------------------------------
+# Appelle une fois par jour l'endpoint qui envoie les nouvelles
+# fiches par email aux abonnés. Ce fichier va dans le repo
+# mon-bureau-backend, au chemin exact :
+#   .github/workflows/vlog-digest.yml
+#
+# Avant que ça marche, il faut créer 1 secret sur GitHub :
+#   Repo mon-bureau-backend → Settings → Secrets and variables
+#   → Actions → "New repository secret"
+#     Nom  : VLOG_DIGEST_SECRET
+#     Valeur : exactement la même valeur que VLOG_DIGEST_SECRET
+#              sur Render (Environment)
+# =========================================================
+
+name: Digest quotidien du Vlog
+
+on:
+  schedule:
+    # 7h du matin, heure de Paris (6h UTC en hiver, 5h UTC en été —
+    # GitHub Actions ne suit pas le changement d'heure, donc c'est
+    # entre 7h et 8h selon la saison, largement suffisant pour un digest).
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}   # permet aussi de le lancer à la main pour tester
+
+jobs:
+  envoyer-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Appeler /vlog/send-digest
+        run: |
+          curl -sS -f "https://mon-bureau-backend.onrender.com/vlog/send-digest?key=${{ secrets.VLOG_DIGEST_SECRET }}"

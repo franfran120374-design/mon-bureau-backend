@@ -9,6 +9,7 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import webPush from 'web-push';
 import mountEmploi from './emploi-routes.js';
+import mountVlog from './vlog-routes.js';
 dotenv.config();
 
 // Supabase — projet ACTIF de Sandra (l'ancien tbbdkrapsmbzdfxxroda n'existe
@@ -115,6 +116,7 @@ async function removePushSubscription(endpoint) {
 // d'agenda (voir checkCalendarReminders) d'interroger Calendar de façon
 // autonome, sans que le navigateur soit ouvert.
 let storedGoogleRefreshToken = null;
+function getStoredGoogleRefreshToken() { return storedGoogleRefreshToken; }
 
 async function persistGoogleRefreshToken(refreshToken, email) {
   if (!SYNC_DATA_KEY || !refreshToken) return;
@@ -2304,6 +2306,7 @@ async function checkCalendarReminders() {
 }
 // Tuile Emploi — branchement des routes /emploi/*
 mountEmploi(app);
+mountVlog(app, { getStoredGoogleRefreshToken, refreshAccessToken });
 // =================
 // ERROR HANDLER
 // =================
