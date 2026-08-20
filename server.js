@@ -11,6 +11,7 @@ import webPush from 'web-push';
 import mountEmploi from './emploi-routes.js';
 import mountLettre from './emploi-lettre.js';
 import mountVlog from './vlog-routes.js';
+import mountBiomimetisme from './biomimetisme-routes.js';
 dotenv.config();
 
 // Supabase — projet ACTIF de Sandra (l'ancien tbbdkrapsmbzdfxxroda n'existe
@@ -2309,6 +2310,7 @@ async function checkCalendarReminders() {
 mountEmploi(app);
 mountLettre(app);
 mountVlog(app, { getStoredGoogleRefreshToken, refreshAccessToken });
+mountBiomimetisme(app);
 // =================
 // ERROR HANDLER
 // =================
